@@ -77,7 +77,7 @@ export function ChatView({ place, path, data, repliesPath, logExists, me, canWri
       {items.map((item, i) => item.kind === "thread"
         ? <ThreadCard key={"thread-" + item.thread.id} thread={item.thread} me={me} path={path} onOpen={onOpen} />
         : <XoRow key={item.message.id} message={item.message} cont={i > 0 && items[i - 1].kind === "message" && sameSpeaker((items[i - 1] as { message: Message }).message, item.message, me)} me={me} path={path} onOpen={onOpen} />)}
-      {replying && <li className="xo-them"><div className="xo-head"><b>{xoProject} coordinator</b></div><div className="xo-shimmer">The coordinator is replying…</div></li>}
+      {replying && <li className="xo-them"><article className="xo-card"><header className="xo-head"><b>{xoProject} coordinator</b></header><div className="xo-shimmer">The coordinator is replying…</div></article></li>}
       <div ref={end} />
     </ol>
     : <ol className="thread">
@@ -185,17 +185,22 @@ function ThreadCard({ thread, me, path, onOpen }: { thread: Thread; me: string |
   const steps = thread.status.split("\n").map(line => line.trim()).filter(Boolean);
   return <li className={`xo-thread${open ? " open" : ""}`}>
     <button type="button" className="xo-thread-head" aria-expanded={open} onClick={() => setOpen(value => !value)}>
-      <MessagesSquare size={15} className="xo-thread-ic" />
-      <span className="xo-thread-title">{thread.title || "Thread"}</span>
+      <span className="xo-thread-ic"><MessagesSquare size={15} /></span>
+      <span className="xo-thread-name">
+        <span className="xo-thread-kicker">Thread</span>
+        <span className="xo-thread-title">{thread.title || "Untitled thread"}</span>
+      </span>
       <span className={`xo-pill ${tone}`}>{state}</span>
-      <span className="xo-thread-count">{thread.messages.length} {thread.messages.length === 1 ? "message" : "messages"}</span>
-      <ChevronDown size={15} className="xo-thread-chev" />
+      <ChevronDown size={16} className="xo-thread-chev" />
     </button>
     {steps.length > 0 && <ul className="xo-steps">{steps.map((step, i) => {
       const done = step.startsWith("✓");
       return <li key={i} className={done ? "done" : ""}>{done ? <Check size={13} /> : <Circle size={11} />}<span>{step.replace(/^[✓○●•\-]\s*/, "")}</span></li>;
     })}</ul>}
-    {thread.outputs.length > 0 && <div className="xo-outputs">{thread.outputs.map(name => <span key={name}><FileText size={13} />{name}</span>)}</div>}
+    {(thread.outputs.length > 0 || thread.messages.length > 0) && <div className="xo-thread-foot">
+      {thread.outputs.map(name => <span key={name} className="xo-file"><FileText size={13} />{name}</span>)}
+      <button type="button" className="xo-thread-open" onClick={() => setOpen(value => !value)}>{open ? "Hide messages" : `Show ${thread.messages.length} ${thread.messages.length === 1 ? "message" : "messages"}`}</button>
+    </div>}
     {open && <ol className="xo-thread-msgs">
       {thread.messages.map((message, i) => <XoRow key={message.id} message={message} cont={i > 0 && sameSpeaker(thread.messages[i - 1], message, me)} me={me} path={path} onOpen={onOpen} />)}
     </ol>}
@@ -215,9 +220,11 @@ function XoRow({ message, cont, me, path, onOpen }: { message: Message; cont: bo
     <div className="xo-meta">{message.saving ? "Sending…" : when(message.time)}</div>
   </li>;
   return <li className={`xo-them${cont ? " cont" : ""}`}>
-    {!cont && <div className="xo-head"><b>{message.author || "User"}</b>{message.detail && <span>{message.detail}</span>}{when(message.time)}</div>}
-    <div className="xo-prose"><Markdown content={message.content} filePath={path} navigate={onOpen} /></div>
-    {links}
+    <article className="xo-card">
+      {!cont && <header className="xo-head"><b>{message.author || "User"}</b>{message.detail && <span>{message.detail}</span>}<span className="xo-time">{when(message.time)}</span></header>}
+      <div className="xo-prose"><Markdown content={message.content} filePath={path} navigate={onOpen} /></div>
+      {links}
+    </article>
   </li>;
 }
 
