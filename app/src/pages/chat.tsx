@@ -56,10 +56,9 @@ export function ChatView({ place, path, data, repliesPath, logExists, me, canWri
   }, [chat.draft]);
 
   return <div className={`chat${xo ? " chat-xo" : ""}`}>
-    {head && <div className="chat-head">
-      {xo ? <><span className="xo-tile big"><XoMark /></span><div><h2>{xoProject}</h2><p>Linked with XO Space · one conversation here and there</p></div></>
-        : <><div><h2>{text(data.title) || path.split("/").pop()}</h2>{text(data.subtitle) && <p>{text(data.subtitle)}</p>}</div>
-          {people.length > 0 && <AvatarStack names={people} />}</>}
+    {head && !xo && <div className="chat-head">
+      <div><h2>{text(data.title) || path.split("/").pop()}</h2>{text(data.subtitle) && <p>{text(data.subtitle)}</p>}</div>
+      {people.length > 0 && <AvatarStack names={people} />}
     </div>}
     {xo ? <ol className="xo-msgs">
       {all.length === 0 && <li className="xo-empty">No messages yet. Tell the {xoProject} coordinator what you would like done.</li>}

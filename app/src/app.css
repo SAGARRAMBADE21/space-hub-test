@@ -684,10 +684,7 @@ a.label:hover { text-decoration: none; filter: brightness(.96); }
    your messages are bubbles on the right, the coordinator's are prose under its name, notes are one quiet line. */
 .chat-xo { --xo-green: #487620; --xo-fill: #83D63A; --xo-fill-hover: #76C134; --xo-on-fill: #1E1E1E; --xo-bubble: var(--fill); }
 :root[data-theme="dark"] .chat-xo { --xo-green: #83D63A; --xo-fill-hover: #96DC58; --xo-on-fill: #141414; --xo-bubble: #262626; }
-.chat-xo .chat-head { gap: 12px; padding: 14px 20px; }
-.chat-xo .chat-head h2 { font-size: 17px; letter-spacing: -.01em; }
 .xo-tile { flex: none; display: grid; place-items: center; width: 30px; height: 30px; border-radius: 9px; border: 1px solid var(--line); background: var(--panel); color: var(--text); }
-.xo-tile.big { width: 36px; height: 36px; border-radius: 10px; }
 .xo-tile .avatar, .xo-tile img { border-radius: 9px; }
 .xo-msgs { list-style: none; flex: 1; width: 100%; max-width: 760px; margin: 0 auto; padding: 24px 20px 12px; box-sizing: border-box; }
 .xo-empty { margin: 40px 0; text-align: center; color: var(--text-3); font-size: 13.5px; }
