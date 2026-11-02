@@ -40,6 +40,7 @@ import AppendChatReducer from "./append_chat_reducer";
 import ClaimAdminReducer from "./claim_admin_reducer";
 import CollabPostReducer from "./collab_post_reducer";
 import ConnectAgentReducer from "./connect_agent_reducer";
+import CoworkPostReducer from "./cowork_post_reducer";
 import CreateAgentReducer from "./create_agent_reducer";
 import CreateOrgReducer from "./create_org_reducer";
 import CreateProjectReducer from "./create_project_reducer";
@@ -362,6 +363,7 @@ const reducersSchema = __reducers(
   __reducerSchema("claim_admin", ClaimAdminReducer),
   __reducerSchema("collab_post", CollabPostReducer),
   __reducerSchema("connect_agent", ConnectAgentReducer),
+  __reducerSchema("cowork_post", CoworkPostReducer),
   __reducerSchema("create_agent", CreateAgentReducer),
   __reducerSchema("create_org", CreateOrgReducer),
   __reducerSchema("create_project", CreateProjectReducer),

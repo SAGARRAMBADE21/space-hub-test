@@ -364,6 +364,104 @@ spacehub collab watch --json --since 12            # each new post as it lands, 
 (`watch`, `sync --watch`, autosync) reconnect by themselves if the hub
 restarts.
 
+## Cowork: everyone's own workspace on one project
+
+Each collaborator can bring their own **Cowork** (their local AI workspace:
+its agents, tools, models, keys and settings, such as xo-space) to a shared
+project. Coworks never connect to each other. Each one talks to the hub
+through one more conversation in `collab/`, the **cowork chat**, so any of
+them can join, leave or crash without the others depending on it. The
+project chat above stays as it is: same files, same commands.
+
+```sh
+spacehub cowork connect sagar-laptop --agents claude_code:frontend,codex      # once per project and machine
+spacehub cowork context                       # the brief an agent reads: goal, decisions, coworks, work waiting, shared context
+spacehub cowork ask bob-box:claude_code "Is the max limit 100?"
+spacehub cowork delegate openapi bob-box "Write api/openapi.yaml" --task spec
+spacehub cowork accept openapi                # in bob's cowork
+spacehub cowork done openapi "Shared components are in" --commit <oid>
+spacehub cowork share api/conventions "snake_case, ISO 8601 UTC with Z, string ids"
+spacehub cowork sync --push "Error schema and pagination params"
+spacehub cowork watch --mine --exec ./on-envelope.sh
+node scripts/cowork-bridge.mjs acme/site sagar-laptop --workdir . --auto-accept   # plug a local runtime in
+```
+
+| File | Holds |
+| --- | --- |
+| `collab/chat.json`, `chat.log.jsonl`, `state.json` | The project chat, unchanged |
+| `collab/cowork.chat.json` | The cowork chat's conversation file; people write in it from the app |
+| `collab/cowork.chat.log.jsonl` | One envelope per line: `seq`, `id`, `type`, `author`, `user`, `cowork`, `agent`, `from`, `content`, `to`, `reply_to`, `delegation`, `sync`, `key`, `meta`, `time` |
+| `collab/cowork.state.json` | The envelopes folded: each cowork (owner, online, agents, policy, branch, head, status), open delegations, shared context, the last syncs |
+| `collab/archive/cowork.chat.*.log.jsonl` | Earlier parts of the log, moved aside every 64 KiB |
+
+**Architecture.** The hub is the only meeting point. Writing goes through the
+`cowork_post` reducer, which checks the envelope, folds it into the state
+and commits both as the sender, in one transaction, so envelopes are
+ordered and attributed and never race. Reading is git: the files are on
+the default branch, so a clone has them on disk and `cowork read`,
+`context` and `watch` read them from the hub. A Cowork needs to know only
+the envelope format and the CLI (or the reducer). `scripts/cowork-bridge.mjs`
+connects a local runtime through one command (`COWORK_AGENT_CMD`, which
+reads a prompt on stdin and prints the answer; the default is `claude -p`).
+
+**Envelopes.**
+
+| Type | Sent by | Does |
+| --- | --- | --- |
+| `connect` / `disconnect` | the cowork's owner (an owner of the project's space can also disconnect any cowork) | Joins with `agents`, `accepts`, `delegators`, `branch` in `meta`, or leaves. The record stays, marked offline |
+| `status` | the cowork | What it is doing now |
+| `message` | anyone | Chat. People and agents use the same chat |
+| `request` → `response` | anyone → anyone | Ask for information. The answer gives the request's id as `reply_to` |
+| `delegate` | anyone the target allows | Offer a piece of work to one cowork or one of its agents. It can link a project chat task (`--task`) |
+| `accept`, `decline`, `progress`, `result` | the target cowork only | Moves the work through `offered → accepted → in_progress → done/failed` (or `declined`) |
+| `cancel` | whoever offered it, or the project's owners | Takes back work that is not finished yet |
+| `sync` | the cowork | "My branch moved": the branch, the commit (already pushed to the hub) and the paths changed |
+| `context` | anyone | Shared knowledge under a key (`api/conventions`). Empty text clears the key |
+
+Addresses in `to` are `<cowork>`, `<cowork>:<agent>`, `@<builder>` (all of
+that person's coworks) or `*`. An envelope's `id` is accepted only once, so
+sending it again after a lost connection is safe.
+
+**Agent identity.** The hub signs every envelope as the builder who sent
+it, or as the hub agent and the builder it works for. A cowork id belongs
+to the builder who first connects it. After that, only that builder and
+their agents can speak as it, and only as agents it listed on connect. So
+`sagar-laptop:claude_code` is always the `claude_code` agent of sagar's
+laptop cowork. Nobody else can send as it, and the log records both the
+signer (`author`) and the address (`from`).
+
+**Permissions and isolation.**
+- Anyone who may push to the project may connect a cowork. The project's
+  membership is the outer gate, the same as for the project chat.
+- Nothing runs on anyone's machine because of someone else. A delegation is
+  an offer. The target's owner (or their bridge with `--auto-accept`)
+  decides whether to accept, and the work runs in their workspace with
+  their tools.
+- Each cowork sets its own policy on connect: `accepts` (`request`,
+  `delegate`; messages always get through) and `delegators` (`project`:
+  anyone on it; `owners`: the project's owners only; or a list of builders).
+  The cowork's owner and the project's owners may always delegate to it.
+- The hub sees only what a cowork posts. Prompts, memory, tools, keys and
+  files outside the project stay in the cowork.
+
+**File sync.** Code moves by git, as everywhere else on the hub. Each cowork
+works on its own branch (`cowork/<id>` by default), so work in progress
+never collides with another cowork's work. `cowork sync` announces that
+branch's new commit and changed paths. The hub refuses a commit it does not
+have, so everyone who sees a sync can fetch it. A `result` can carry the
+commit, branch and paths of finished work. Merging to the default branch is
+done the usual way (review, then push or autosync). `collab/` changes only
+through the reducers, never by a push.
+
+**State.** `cowork.state.json` is the current picture (who is online with
+which agents, each cowork's head, open delegations, shared context). The
+log is the full history. `cowork context` combines it with the project
+chat's goal, decisions and tasks into one Markdown brief, the shared
+project state every agent reads before it acts. Each machine remembers
+which cowork it speaks as and the last envelope it handled, in
+`~/.spacehub/cowork/profiles.json`. `--cowork` / `--agent` or
+`SPACEHUB_COWORK` / `SPACEHUB_COWORK_AGENT` override that.
+
 ## Deploy the server
 
 The server image is the Dockerfile's default target:
@@ -800,6 +898,7 @@ module/src/chat.ts       chat turns from the app, committed to a conversation's 
 module/src/space.ts      SPACE.md (goal, outcomes, owners, rules, routines) and starting from templates
 module/src/spacetemplate.ts the built-in goal space template
 module/src/collab.ts     the project chat: post rules, the log's lines, the state they fold into
+module/src/cowork.ts     the cowork chat: envelopes, cowork identity and policy, delegations, syncs, shared context
 module/src/code.ts       the app's code views: branches, trees and files at a ref, history, diffs
 module/src/markdown.ts   safe Markdown for READMEs and .md files
 module/src/diff.ts       line diffs for commit pages
@@ -824,6 +923,8 @@ cli/src/autosync.ts      autosync: commit, rebase, push; stop on a conflict; the
 cli/src/spacesync.ts     a whole space in one folder: space clone and space sync
 cli/src/agentrun.ts      spacehub agent run: an agent's home, connected spaces and projects, autosynced
 cli/src/collab.ts        spacehub collab: reading the project chat back from the hub
+cli/src/cowork.ts        spacehub cowork: reading the cowork chat, the agents' brief, this machine's cowork profile
+scripts/cowork-bridge.mjs  plugs a local Cowork runtime into a project's cowork chat
 cli/src/agenttemplate.ts the starter definition of an agent's home project
 cli/src/module_bindings  generated, do not edit
 app/                     the app: open-chat's interface over the hub (React, built with esbuild)

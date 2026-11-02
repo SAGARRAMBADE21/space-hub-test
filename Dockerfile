@@ -47,6 +47,7 @@ COPY module/src/style.ts /src/module/src/style.ts
 COPY module/src/protocol.ts /src/module/src/protocol.ts
 COPY module/src/howto.ts /src/module/src/howto.ts
 COPY module/src/collab.ts /src/module/src/collab.ts
+COPY module/src/cowork.ts /src/module/src/cowork.ts
 RUN npm run build
 
 # The hub's app (open-chat's interface), served by the web service at /.

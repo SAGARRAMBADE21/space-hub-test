@@ -41,6 +41,7 @@ import { commitFiles, instantiate } from './space';
 import { BUILTIN_TEMPLATE } from './spacetemplate';
 import { OLDEST_PROTOCOL, PROTOCOL } from './protocol';
 import { CHAT_FILE, CHAT_PATH, COLLAB_DIR, LOG_PATH, STATE_PATH, applyPost, parseState, postFiles, type Author, type PostIn } from './collab';
+import { COWORK_CHAT_FILE, COWORK_CHAT_PATH, COWORK_LOG_PATH, COWORK_STATE_PATH, applyCoworkPost, coworkPostFiles, parseCoworkState, type CoworkPostIn } from './cowork';
 
 const MAX_OBJECT_SIZE = 100 * 1024 * 1024;
 // Fetch windows are cut on `pos`, a running total of row weights per project.
@@ -1031,7 +1032,15 @@ export const appendChat = spacetimedb.reducer(
       }
       return;
     }
-    if (conversation.replace(/^\/+/, '').startsWith(`${COLLAB_DIR}/`)) throw new SenderError(`Only ${CHAT_PATH} takes messages in ${COLLAB_DIR}/.`);
+    // The cowork chat takes them as plain messages from a person, with no cowork.
+    if (conversation.replace(/^\/+/, '') === COWORK_CHAT_PATH) {
+      for (const turn of turns) {
+        if (turn.role !== 'user') throw new SenderError('The cowork chat takes your own messages; agents post from their cowork.');
+        postToCowork(ctx, sp, { id: turn.id, kind: 'message', cowork: '', agent: '', content: turn.content, to: [], replyTo: '', delegation: '', title: '', status: '', key: '', meta: '' });
+      }
+      return;
+    }
+    if (conversation.replace(/^\/+/, '').startsWith(`${COLLAB_DIR}/`)) throw new SenderError(`Only ${CHAT_PATH} and ${COWORK_CHAT_PATH} take messages in ${COLLAB_DIR}/.`);
     const name = `refs/heads/${sp.defaultBranch}`;
     const current = ctx.db.gitRef.key.find(refKey(sp.id, name));
     let built: ReturnType<typeof appendTurns>;
@@ -1129,6 +1138,70 @@ function postToCollab(ctx: Ctx, sp: Project, post: PostIn) {
   }
 }
 
+// ---------------------------------------------------------------- cowork chat
+
+// The cowork chat (cowork.ts): each collaborator's own Cowork connects to
+// the project here, and its agents talk, delegate work and announce their
+// branches to the other coworks. Like the project chat, each envelope is one
+// commit to collab/ on the default branch, made by the hub as the sender, so
+// envelopes are ordered, attributed and never race; the project chat's own
+// files are left alone.
+export const coworkPost = spacetimedb.reducer(
+  {
+    project: t.string(),
+    id: t.string(),
+    kind: t.string(),
+    cowork: t.string(),
+    agent: t.string(),
+    content: t.string(),
+    to: t.array(t.string()),
+    replyTo: t.string(),
+    delegation: t.string(),
+    title: t.string(),
+    status: t.string(),
+    key: t.string(),
+    meta: t.string(),
+  },
+  (ctx, { project: fullName, ...post }) => {
+    postToCowork(ctx, requireWritable(ctx, fullName), post);
+  }
+);
+
+function postToCowork(ctx: Ctx, sp: Project, post: CoworkPostIn) {
+  const author = collabAuthor(ctx, sp);
+  const name = `refs/heads/${sp.defaultBranch}`;
+  const current = ctx.db.gitRef.key.find(refKey(sp.id, name));
+  if (!current) throw new SenderError(`"${sp.fullName}" has no commits on ${sp.defaultBranch} yet; push one before connecting a cowork`);
+  const read = (oid: string) => readObject(ctx.db, sp.id, oid);
+  const now = Number(ctx.timestamp.microsSinceUnixEpoch / 1_000_000n);
+  const time = new Date(Number(ctx.timestamp.microsSinceUnixEpoch / 1000n)).toISOString();
+  try {
+    const log = readFileAt(current.oid, COWORK_LOG_PATH, read);
+    const before = parseCoworkState(readFileAt(current.oid, COWORK_STATE_PATH, read)?.text);
+    const applied = applyCoworkPost(before, post, author, {
+      time,
+      admin: isOwner(ctx, sp.owner, author.name),
+      isOwner: who => isOwner(ctx, sp.owner, who),
+      isParticipant: who => canWrite(ctx, sp, who),
+      hasCommit: oid => read(oid)?.kind === 'commit',
+    });
+    if (!applied) return; // already posted
+    const { files, moved } = coworkPostFiles(log?.text ?? '', before, applied);
+    const encoder = new TextEncoder();
+    const changes: Record<string, FileChange> = {};
+    if (moved && log) changes[moved.to] = { oid: log.oid };
+    for (const [path, text] of Object.entries(files)) changes[path] = encoder.encode(text);
+    if (!readFileAt(current.oid, COWORK_CHAT_PATH, read)) changes[COWORK_CHAT_PATH] = encoder.encode(COWORK_CHAT_FILE);
+    const subject = `cowork: ${post.kind} #${applied.line.seq} from ${applied.line.from}`;
+    const built = editFiles({ head: current.oid, changes, author: author.name, now, message: `${subject}\n\nPosted to the cowork chat (${COWORK_LOG_PATH}).`, read });
+    commitToDefault(ctx, sp, current, built);
+    logActivity(ctx, { projectId: sp.id, path: sp.fullName, kind: 'cowork_posted', subject: post.kind, oid: built.commit, count: applied.line.seq, text: applied.line.content || applied.line.delegation?.title || '' });
+  } catch (err) {
+    if (err instanceof SenderError) throw err;
+    throw new SenderError(err instanceof Error ? err.message : String(err));
+  }
+}
+
 // The tree id of collab/ in a commit ("" when it has none).
 function collabTreeOf(ctx: Ctx, projectId: bigint, commitOid: string) {
   if (!commitOid) return '';
@@ -1150,7 +1223,7 @@ function guardCollab(ctx: Ctx, sp: Project, ref: string, oldOid: string, newOid:
   if (isSyncer(ctx, sp.owner)) return;
   if (isOwner(ctx, sp.owner, actorName(ctx)) && (force || !oldOid)) return;
   throw new SenderError(
-    `${COLLAB_DIR}/ is the project chat and changes only through "spacehub collab post"; undo your changes to ${COLLAB_DIR}/ (git checkout ${REMOTE_HINT}/${sp.defaultBranch} -- ${COLLAB_DIR}) and push again`
+    `${COLLAB_DIR}/ is the project chat and the cowork chat, and changes only through "spacehub collab" and "spacehub cowork"; undo your changes to ${COLLAB_DIR}/ (git checkout ${REMOTE_HINT}/${sp.defaultBranch} -- ${COLLAB_DIR}) and push again`
   );
 }
 

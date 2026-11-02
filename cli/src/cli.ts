@@ -22,6 +22,7 @@ import { cloneProject, findManifest, SpaceSync, writeManifest } from './spacesyn
 import { DEFAULT_HUB_HOST, githubTokenTarget, hubUrl, parseHubUrl, REMOTE } from './url';
 import { deviceSignIn } from './devicelogin';
 import { formatLine, formatState, linesSince, newPost, POST_KINDS, readChat, TASK_STATUSES, type CollabLine } from './collab';
+import { addressedTo, briefing, coworkLinesSince, formatCoworkLine, formatCoworkState, loadProfile, newEnvelope, readCoworkChat, saveProfile, type CoworkLine } from './cowork';
 
 quietSdkLogs();
 
@@ -133,6 +134,33 @@ PROJECT CHAT (collab/ in the project: one conversation for its people and their 
                                     [--status open|in_progress|blocked|done|cancelled]
                                     [--owner <name> | --claim]
   collab handoff [-p <project>] <id> <to> [<note>]   Hand a task to someone else on the project
+
+COWORK CHAT (collab/cowork.chat.*: each collaborator's own Cowork and its agents, on one project)
+  cowork connect [-p <project>] <id>       Connect your cowork (remembered for this project here)
+                                    [--agents <name[:role]>,...] [--branch <name>, default cowork/<id>]
+                                    [--accepts request,delegate] [--delegators project|owners|<builder,...>]
+                                    [--client <text>] [--agent <name>: the agent you speak as]
+  cowork disconnect [-p <project>] [<id>]  Leave (the project's owners may disconnect anyone's)
+  cowork status [<project>]                Coworks, agents and heads, open delegations, syncs, context  [--json]
+  cowork context [<project>]               The brief an agent reads before it acts (Markdown)  [--last <n>] [--json]
+  cowork say [-p <project>] <text>         A message  [--to <address,...>] [--reply-to <id>] [--status]
+  cowork ask [-p <project>] <to> <question>      A request; the answer comes back as a response
+  cowork answer [-p <project>] <envelope id> <text>
+  cowork delegate [-p <project>] <id> <to> <title>   Offer work to one cowork or agent
+                                    [--note <text>] [--task <project chat task>]
+  cowork accept|decline [-p <project>] <id> [<note>]
+  cowork progress [-p <project>] <id> <note>
+  cowork done [-p <project>] <id> <summary>  [--failed] [--commit <oid>] [--branch <name>] [--paths a,b]
+  cowork cancel [-p <project>] <id> [<note>]
+  cowork sync [-p <project>] [<summary>]   Announce where your branch is: its commit and changed paths
+                                    [--push: push HEAD to your cowork branch first] [--branch <name>]
+  cowork share [-p <project>] <key> <text> Shared context under a key ("-" reads stdin; "" clears it)
+  cowork read [<project>]                  The envelopes  [--since <seq>] [--last <n>] [--json]
+  cowork inbox [<project>]                 What reached your cowork since you last looked  [--all] [--json]
+  cowork watch [<project>]                 Print each new envelope  [--mine] [--since <seq>] [--json]
+                                    [--exec <command>]: run it per envelope, as JSON in SPACEHUB_COWORK_POST
+  Addresses: <cowork>, <cowork>:<agent>, @<builder> or *. You speak as --cowork / --agent, else
+  SPACEHUB_COWORK / SPACEHUB_COWORK_AGENT, else what connect remembered.
 
   <project> is space/name, or just name for your personal space. Inside a clone
   it defaults to the repository's quirq remote. Older forms still work: space
@@ -1023,6 +1051,261 @@ async function collabWatch(args: string[]) {
   await new Promise(() => {});
 }
 
+// ---------------------------------------------------------------- cowork chat
+
+// The cowork chat as it is on the hub now.
+async function hubCowork(fullName: string) {
+  const sp = await requireProject(fullName);
+  const { conn } = await open();
+  const read = hubObjects(conn, sp.id);
+  const head = (await listRefs(conn, sp.id)).find(r => r.name === `refs/heads/${sp.defaultBranch}`)?.oid;
+  if (!head) die(`${fullName} has no commits yet`);
+  return { sp, conn, read, chat: await readCoworkChat(read, head) };
+}
+
+// Who this command speaks as: flags, then the environment, then what connect remembered.
+function speaker(args: string[], fullName: string, required = true) {
+  const profile = loadProfile(fullName);
+  const cowork = (opt(args, '--cowork') ?? process.env.SPACEHUB_COWORK ?? profile?.cowork ?? '').toLowerCase();
+  const agent = (opt(args, '--agent', '--as') ?? process.env.SPACEHUB_COWORK_AGENT ?? profile?.agent ?? '').toLowerCase();
+  if (required && !cowork) die(`no cowork for ${fullName} on this machine; run: spacehub cowork connect -p ${fullName} <id> (or pass --cowork)`);
+  return { cowork, agent: cowork ? agent : '' };
+}
+
+async function sendEnvelope(fullName: string, fields: Parameters<typeof newEnvelope>[0], json: boolean, said = `sent to the cowork chat of ${fullName}`) {
+  const envelope = newEnvelope(fields);
+  const { conn } = await open();
+  await conn.reducers.coworkPost({ project: fullName, ...envelope });
+  out(json ? JSON.stringify({ project: fullName, id: envelope.id }) : said);
+  return envelope.id;
+}
+
+// Move this machine's "last seen" mark, for the cowork it remembers only.
+function markSeen(fullName: string, cowork: string, seq: number) {
+  if (cowork && loadProfile(fullName)?.cowork === cowork) saveProfile(fullName, { seen: seq });
+}
+
+function printEnvelope(line: CoworkLine, json: boolean) {
+  out(json ? JSON.stringify(line) : formatCoworkLine(line));
+}
+
+function textArg(args: string[]) {
+  const text = args.join(' ');
+  return text === '-' ? fs.readFileSync(0, 'utf8') : text;
+}
+
+async function coworkConnect(args: string[]) {
+  const fullName = await resolveProject(opt(args, '-p', '--project'));
+  const agentsFlag = opt(args, '--agents');
+  const branch = opt(args, '--branch');
+  const accepts = opt(args, '--accepts');
+  const delegators = opt(args, '--delegators');
+  const client = opt(args, '--client');
+  const json = bool(args, '--json');
+  const { cowork: fallback, agent } = speaker(args, fullName, false);
+  const cowork = (args.shift() ?? fallback).toLowerCase();
+  if (!cowork) die('usage: spacehub cowork connect [-p <project>] <id> [--agents <name[:role]>,...]');
+  const meta: Record<string, unknown> = {};
+  if (agentsFlag !== undefined) meta.agents = names(agentsFlag).map(entry => { const [name, ...role] = entry.split(':'); return { name, role: role.join(':') }; });
+  if (branch) meta.branch = branch;
+  if (accepts !== undefined) meta.accepts = names(accepts);
+  if (delegators) meta.delegators = delegators === 'project' || delegators === 'owners' ? delegators : names(delegators);
+  meta.client = client ?? `spacehub ${VERSION}`;
+  await sendEnvelope(fullName, { kind: 'connect', cowork, agent, content: args.join(' '), meta: JSON.stringify(meta) }, json, `${cowork} is connected to ${fullName}`);
+  saveProfile(fullName, { cowork, agent });
+}
+
+async function coworkDisconnect(args: string[]) {
+  const fullName = await resolveProject(opt(args, '-p', '--project'));
+  const json = bool(args, '--json');
+  const { cowork: mine } = speaker(args, fullName, false);
+  const cowork = (args.shift() ?? mine).toLowerCase() || die('usage: spacehub cowork disconnect [-p <project>] [<id>]');
+  await sendEnvelope(fullName, { kind: 'disconnect', cowork, content: args.join(' ') }, json, `${cowork} is disconnected from ${fullName}`);
+  if (cowork === mine) saveProfile(fullName, null);
+}
+
+async function coworkStatus(args: string[]) {
+  const json = bool(args, '--json');
+  const fullName = await resolveProject(opt(args, '-p', '--project') ?? args[0]);
+  const { chat } = await hubCowork(fullName);
+  out(json ? JSON.stringify({ ...chat.state, recent_ids: undefined }, null, 2) : formatCoworkState(chat.state));
+}
+
+async function coworkContext(args: string[]) {
+  const json = bool(args, '--json');
+  const last = Number(opt(args, '--last') ?? 20);
+  const fullName = await resolveProject(opt(args, '-p', '--project') ?? args[0]);
+  const { cowork } = speaker(args, fullName, false);
+  const { chat } = await hubCowork(fullName);
+  const user = chat.state.coworks[cowork]?.owner ?? (await whoAmI());
+  const recent = chat.lines.slice(-Math.max(0, last));
+  if (json) out(JSON.stringify({ project: fullName, commit: chat.commit, me: { cowork, user }, goal: chat.project.goal, decisions: chat.project.decisions, tasks: chat.project.tasks, cowork: { ...chat.state, recent_ids: undefined }, recent }, null, 2));
+  else out(briefing(fullName, chat, { cowork: cowork || '(none)', user }, recent));
+}
+
+async function coworkSay(args: string[]) {
+  const fullName = await resolveProject(opt(args, '-p', '--project'));
+  const me = speaker(args, fullName, false);
+  const to = names(opt(args, '--to'));
+  const replyTo = opt(args, '--reply-to') ?? '';
+  const status = bool(args, '--status');
+  const json = bool(args, '--json');
+  const content = textArg(args);
+  if (!content.trim()) die('usage: spacehub cowork say [-p <project>] <text> [--to <address,...>] [--status]');
+  if (status && !me.cowork) die('a status comes from your cowork; connect it first');
+  await sendEnvelope(fullName, { kind: status ? 'status' : 'message', ...me, to, replyTo, content }, json);
+}
+
+async function coworkAsk(args: string[]) {
+  const fullName = await resolveProject(opt(args, '-p', '--project'));
+  const me = speaker(args, fullName, false);
+  const json = bool(args, '--json');
+  const to = names(args.shift());
+  const content = textArg(args);
+  if (!to.length || !content.trim()) die('usage: spacehub cowork ask [-p <project>] <address,...> <question>');
+  await sendEnvelope(fullName, { kind: 'request', ...me, to, content }, json, `asked ${to.join(', ')}`);
+}
+
+async function coworkAnswer(args: string[]) {
+  const fullName = await resolveProject(opt(args, '-p', '--project'));
+  const me = speaker(args, fullName, false);
+  const json = bool(args, '--json');
+  const replyTo = args.shift() ?? die('usage: spacehub cowork answer [-p <project>] <envelope id> <text>');
+  const content = textArg(args);
+  // Send the answer to whoever asked.
+  const { chat } = await hubCowork(fullName);
+  const asked = chat.lines.find(l => l.id === replyTo);
+  await sendEnvelope(fullName, { kind: 'response', ...me, replyTo, to: asked ? [asked.from === asked.author && !asked.cowork ? `@${asked.user}` : asked.from] : [], content }, json, 'answered');
+}
+
+async function coworkDelegate(args: string[]) {
+  const fullName = await resolveProject(opt(args, '-p', '--project'));
+  const me = speaker(args, fullName, false);
+  const note = opt(args, '--note') ?? '';
+  const task = opt(args, '--task');
+  const json = bool(args, '--json');
+  const delegation = args.shift();
+  const to = args.shift()?.toLowerCase();
+  const title = args.join(' ');
+  if (!delegation || !to || !title.trim()) die('usage: spacehub cowork delegate [-p <project>] <id> <cowork[:agent]> <title> [--note <text>] [--task <id>]');
+  await sendEnvelope(fullName, { kind: 'delegate', ...me, delegation, to: [to], title, content: note || title, meta: task ? JSON.stringify({ collab_task: task }) : '' }, json, `offered ${delegation} to ${to}`);
+}
+
+async function coworkAnswerWork(args: string[], kind: 'accept' | 'decline' | 'progress' | 'result' | 'cancel') {
+  const fullName = await resolveProject(opt(args, '-p', '--project'));
+  const me = speaker(args, fullName, kind !== 'cancel');
+  const failed = bool(args, '--failed');
+  const commit = opt(args, '--commit');
+  const branch = opt(args, '--branch');
+  const paths = opt(args, '--paths');
+  const json = bool(args, '--json');
+  const delegation = args.shift() ?? die(`usage: spacehub cowork ${kind === 'result' ? 'done' : kind} [-p <project>] <id> ${kind === 'result' || kind === 'progress' ? '<note>' : '[<note>]'}`);
+  const content = textArg(args);
+  const meta = kind === 'result' ? { ...(commit ? { commit } : {}), ...(branch ? { branch } : {}), ...(paths ? { paths: paths.split(',').map(p => p.trim()).filter(Boolean) } : {}) } : {};
+  await sendEnvelope(fullName, { kind, ...me, delegation, content, status: kind === 'result' ? (failed ? 'failed' : 'done') : '', meta: Object.keys(meta).length ? JSON.stringify(meta) : '' }, json, `${delegation}: ${kind === 'result' ? (failed ? 'failed' : 'done') : kind}`);
+}
+
+// Announce where this clone's branch is, after pushing it with --push.
+async function coworkSync(args: string[]) {
+  const fullName = await resolveProject(opt(args, '-p', '--project'));
+  const me = speaker(args, fullName);
+  const push = bool(args, '--push');
+  const json = bool(args, '--json');
+  const branchFlag = opt(args, '--branch');
+  const { chat } = await hubCowork(fullName);
+  const mine = chat.state.coworks[me.cowork] ?? die(`${me.cowork} is not connected to ${fullName}; run: spacehub cowork connect ${me.cowork}`);
+  const branch = branchFlag ?? mine.branch;
+  if (push) {
+    const found = await projectRemote();
+    if (!found) die('--push runs inside a clone of the project');
+    await runOrDie('git', ['push', found.remote, `HEAD:refs/heads/${branch}`]);
+  }
+  const commit = (await git(['rev-parse', 'HEAD'])).trim();
+  const base = mine.head?.commit ?? '';
+  let paths: string[] = [];
+  try {
+    const range = base ? `${base}..${commit}` : `${commit}~1..${commit}`;
+    paths = (await git(['diff', '--name-only', range])).split('\n').filter(Boolean).slice(0, 200);
+  } catch {
+    // The last head is not in this clone; announce without paths.
+  }
+  const summary = textArg(args) || (await git(['log', '-1', '--format=%s', commit])).trim();
+  await sendEnvelope(fullName, { kind: 'sync', ...me, content: summary, meta: JSON.stringify({ branch, commit, paths }) }, json, `${me.cowork}: ${branch} is at ${commit.slice(0, 10)} (${paths.length} paths)`);
+}
+
+async function coworkShare(args: string[]) {
+  const fullName = await resolveProject(opt(args, '-p', '--project'));
+  const me = speaker(args, fullName, false);
+  const json = bool(args, '--json');
+  const key = args.shift() ?? die('usage: spacehub cowork share [-p <project>] <key> <text>');
+  await sendEnvelope(fullName, { kind: 'context', ...me, key, content: textArg(args) }, json, `shared ${key}`);
+}
+
+async function coworkRead(args: string[]) {
+  const since = Number(opt(args, '--since') ?? 0);
+  const last = opt(args, '--last');
+  const json = bool(args, '--json');
+  const fullName = await resolveProject(opt(args, '-p', '--project') ?? args[0]);
+  const { read, chat } = await hubCowork(fullName);
+  let lines = await coworkLinesSince(read, chat, since);
+  if (last) lines = lines.slice(-Math.max(1, Number(last)));
+  if (!lines.length && !json) out(chat.state.seq ? `nothing after #${since}` : `no cowork has connected to ${fullName} yet`);
+  for (const line of lines) printEnvelope(line, json);
+}
+
+async function coworkInbox(args: string[]) {
+  const all = bool(args, '--all');
+  const json = bool(args, '--json');
+  const fullName = await resolveProject(opt(args, '-p', '--project') ?? args[0]);
+  const me = speaker(args, fullName);
+  const { read, chat } = await hubCowork(fullName);
+  const owner = chat.state.coworks[me.cowork]?.owner ?? '';
+  const since = all ? 0 : loadProfile(fullName)?.seen ?? 0;
+  const lines = (await coworkLinesSince(read, chat, since)).filter(line => addressedTo(line, me.cowork, owner));
+  for (const line of lines) printEnvelope(line, json);
+  if (!lines.length && !json) out(`nothing new for ${me.cowork} after #${since}`);
+  markSeen(fullName, me.cowork, chat.state.seq);
+}
+
+// Follow the default branch; each new envelope prints once, in order.
+async function coworkWatch(args: string[]) {
+  const sinceArg = opt(args, '--since');
+  const command = opt(args, '--exec');
+  const mineOnly = bool(args, '--mine');
+  const json = bool(args, '--json');
+  const fullName = await resolveProject(opt(args, '-p', '--project') ?? args[0]);
+  const me = speaker(args, fullName, mineOnly);
+  let defaultRef = '';
+  let last = sinceArg === undefined ? -1 : Number(sinceArg);
+  const tick = serialized(async () => {
+    const head = [...conn.db.gitRef.iter()].find(r => r.projectId === sp.id && r.name === defaultRef)?.oid;
+    if (!head) return;
+    const chat = await readCoworkChat(read, head);
+    if (last < 0) last = chat.state.seq;
+    if (chat.state.seq <= last) return;
+    const owner = chat.state.coworks[me.cowork]?.owner ?? '';
+    for (const line of await coworkLinesSince(read, chat, last)) {
+      last = line.seq;
+      markSeen(fullName, me.cowork, line.seq);
+      if (mineOnly && !addressedTo(line, me.cowork, owner)) continue;
+      printEnvelope(line, json);
+      if (command) {
+        const env = { ...process.env, SPACEHUB_COWORK_POST: JSON.stringify(line), SPACEHUB_COWORK_PROJECT: fullName, SPACEHUB_COWORK: me.cowork, SPACEHUB_COWORK_AGENT: me.agent };
+        await new Promise<void>(resolve => spawn('sh', ['-c', command], { stdio: ['ignore', 'inherit', 'inherit'], env }).on('close', () => resolve()).on('error', () => resolve()));
+      }
+    }
+  });
+  const { conn, sp } = await followRefs(fullName, refName => {
+    if (refName === defaultRef) void tick();
+  });
+  defaultRef = `refs/heads/${sp.defaultBranch}`;
+  const read = hubObjects(conn, sp.id);
+  await announce(fullName, 'watch');
+  note(`Watching the cowork chat of ${fullName}${me.cowork ? ` as ${me.cowork}` : ''}${last >= 0 ? ` after #${last}` : ''} (ctrl-c to stop)`);
+  void tick();
+  await new Promise(() => {});
+}
+
 // ---------------------------------------------------------------- spaces
 
 // Flags that take a value, so the first positional argument can be found
@@ -1557,6 +1840,31 @@ async function main() {
       case 'handoff': return collabTask(args, true);
     }
     die(`usage: spacehub collab <post|read|state|watch|task|handoff>`);
+  }
+
+  if (group === 'cowork') {
+    longLived = sub === 'watch';
+    switch (sub) {
+      case 'connect': return coworkConnect(args);
+      case 'disconnect': return coworkDisconnect(args);
+      case 'status': case 'state': return coworkStatus(args);
+      case 'context': case 'brief': return coworkContext(args);
+      case 'say': case 'post': return coworkSay(args);
+      case 'ask': return coworkAsk(args);
+      case 'answer': case 'reply': return coworkAnswer(args);
+      case 'delegate': return coworkDelegate(args);
+      case 'accept': return coworkAnswerWork(args, 'accept');
+      case 'decline': return coworkAnswerWork(args, 'decline');
+      case 'progress': return coworkAnswerWork(args, 'progress');
+      case 'done': case 'result': return coworkAnswerWork(args, 'result');
+      case 'cancel': return coworkAnswerWork(args, 'cancel');
+      case 'sync': return coworkSync(args);
+      case 'share': return coworkShare(args);
+      case 'read': case 'log': return coworkRead(args);
+      case 'inbox': return coworkInbox(args);
+      case 'watch': return coworkWatch(args);
+    }
+    die(`usage: spacehub cowork <connect|disconnect|status|context|say|ask|answer|delegate|accept|decline|progress|done|cancel|sync|share|read|inbox|watch>`);
   }
 
   die(`unknown command "${group}"; see spacehub help`);
