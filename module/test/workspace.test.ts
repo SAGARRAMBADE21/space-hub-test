@@ -289,7 +289,14 @@ describe('agents', () => {
     expect(agents[0].spaces).toEqual(['quirq']);
     expect(agents.every(a => a.running.length === 0)).toBe(true);
     expect(view({ space: 'alice' }).meta).toMatchObject({ agents: ['helper'] });
-    expect(view({ space: 'quirq', project: 'quirq' }).meta).toMatchObject({ members: ['bob'], agents: ['helper'], collaborators: [] });
+    expect(view({ space: 'quirq', project: 'quirq' }).meta).toMatchObject({ members: ['bob'], agents: ['helper'], brought: [], collaborators: [] });
     void db;
+  });
+
+  it('show which agents were brought to one project, and by whom', () => {
+    const { call, alice, view } = hub();
+    call(alice, mod.createAgent, { name: 'helper', parent: 'alice', identity: '7'.padStart(64, '0'), token: 'seven', description: '' });
+    call(alice, mod.addProjectMember, { project: 'quirq/quirq', agent: 'helper' });
+    expect(view({ space: 'quirq', project: 'quirq' }).meta).toMatchObject({ agents: ['helper'], brought: [{ agent: 'helper', by: 'alice' }], collaborators: [] });
   });
 });

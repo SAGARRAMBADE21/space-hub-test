@@ -24,7 +24,7 @@ export type SpaceMeta = {
 export type ProjectMeta = {
   level: "project"; fullName: string; space: string; name: string; description: string; defaultBranch: string; bytes: number;
   head: { oid: string; subject: string; author: string; time: string } | null; deps: number; canWrite: boolean; owners: string[]; members: string[]; agents: string[];
-  collaborators: string[]; here: Here[]; activity: ActivityItem[]; goal: SpaceGoal | null;
+  brought?: { agent: string; by: string }[]; collaborators: string[]; here: Here[]; activity: ActivityItem[]; goal: SpaceGoal | null;
 };
 export type Meta = HubMeta | SpaceMeta | ProjectMeta;
 export type View<M extends Meta = Meta> = { snapshot: WorkspaceSnapshot; meta: M };

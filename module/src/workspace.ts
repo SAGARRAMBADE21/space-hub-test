@@ -178,6 +178,8 @@ export type Meta =
       members: string[];
       /** Agents that may push here: connected to the space, or collaborators on the project. */
       agents: string[];
+      /** Agents brought to this project only, and who brought each; they may take it away. */
+      brought: { agent: string; by: string }[];
       collaborators: string[];
       here: Here[];
       activity: ActivityItem[];
@@ -501,11 +503,13 @@ function rolesOf(db: Db, space: string) {
 
 function projectPeople(db: Db, project: Project) {
   const { owners, members, agents } = rolesOf(db, project.owner);
-  const collaborators = [...db.projectMember.projectId.filter(project.id)].map(row => row.agent);
+  const rows = [...db.projectMember.projectId.filter(project.id)];
+  const collaborators = rows.map(row => row.agent);
   return {
     owners,
     members,
     agents: [...new Set([...agents, ...collaborators.filter(name => isAgent(db, name))])].sort(),
+    brought: rows.filter(row => isAgent(db, row.agent)).map(row => ({ agent: row.agent, by: row.addedBy })).sort((a, b) => a.agent.localeCompare(b.agent)),
     collaborators: collaborators.filter(name => !isAgent(db, name)).sort(),
   };
 }

@@ -9,6 +9,8 @@
 //   GET  /-/api/me                         who is signed in
 //   GET  /-/avatar/<name>                  a builder's, org's or agent's picture (avatar.ts)
 //   POST /-/api/chat                       save chat turns as the signed-in builder (append_chat)
+//   POST /-/api/collaborators              add or remove a project's collaborator as the signed-in
+//                                          builder (add_project_member, remove_project_member)
 //
 // The browser never talks to SpacetimeDB: reads come from the module over
 // HTTP, and a chat is saved with the session's own token, so the module's
@@ -104,6 +106,15 @@ export function parseChat(input: unknown) {
   return { project: `${input.space}/${input.project}`, conversation: input.conversation, turns: turns as { id: string; role: string; content: string; links: { label: string; path: string }[] }[] };
 }
 
+/** A collaborator change a browser may send; the module checks who may make it. */
+export function parseCollaborator(input: unknown) {
+  if (!object(input) || typeof input.space !== 'string' || typeof input.project !== 'string' || typeof input.name !== 'string') return null;
+  if (input.action !== 'add' && input.action !== 'remove') return null;
+  const name = input.name.trim().replace(/^@/, '').toLowerCase();
+  if (!input.space || !input.project || !/^[a-z0-9][a-z0-9-]*$/.test(name)) return null;
+  return { action: input.action as 'add' | 'remove', project: `${input.space}/${input.project}`, agent: name };
+}
+
 /** Handle the app's routes; false when the request is not one of them. */
 export async function handleApp(deps: AppDeps, req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<boolean> {
   const route = url.pathname;
@@ -170,6 +181,34 @@ export async function handleApp(deps: AppDeps, req: http.IncomingMessage, res: h
         return true;
       });
       if (!saved) return json(res, 401, { error: 'Sign in to save chats.' }), true;
+      return json(res, 200, { ok: true }), true;
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : String(error)).replace(/^Error: /, '');
+      return json(res, /permission denied/.test(message) ? 403 : 400, { error: message }), true;
+    }
+  }
+
+  if (route === '/-/api/collaborators') {
+    if (req.method !== 'POST') return json(res, 405, { error: 'Change collaborators with POST.' }), true;
+    if (req.headers['content-type']?.split(';')[0] !== 'application/json') return json(res, 415, { error: 'Send JSON.' }), true;
+    const token = /(?:^|;\s*)spacehub_session=([^;]*)/.exec(req.headers.cookie ?? '')?.[1];
+    if (!token) return json(res, 401, { error: 'Sign in to change collaborators.' }), true;
+    let input: ReturnType<typeof parseCollaborator>;
+    try {
+      input = parseCollaborator(await readJson(req));
+    } catch {
+      return json(res, 400, { error: 'Invalid request.' }), true;
+    }
+    if (!input) return json(res, 400, { error: 'Send a space, project, action (add or remove) and a builder or agent name.' }), true;
+    const { action, ...change } = input;
+    try {
+      const done = await deps.withConn(decodeURIComponent(token), async (conn, identity) => {
+        if (!(await findUser(conn, identity))) return false;
+        if (action === 'add') await conn.reducers.addProjectMember(change);
+        else await conn.reducers.removeProjectMember(change);
+        return true;
+      });
+      if (!done) return json(res, 401, { error: 'Sign in to change collaborators.' }), true;
       return json(res, 200, { ok: true }), true;
     } catch (error) {
       const message = (error instanceof Error ? error.message : String(error)).replace(/^Error: /, '');

@@ -8,6 +8,7 @@ import { DepsTab } from "./deps";
 import { FilesTab, isChannel } from "./files";
 import { PathBar } from "@/shell/path-bar";
 import { GoalChip, GoalPanel } from "./goal";
+import { ManageCollaborators } from "./collaborators";
 
 type ProjectRoute = Extract<Route, { page: "project" }>;
 
@@ -47,6 +48,7 @@ export function ProjectPage({ route, view, error, me, signIn, refresh }: { route
     {route.tab === "branches" && <BranchesTab place={place} />}
     {meta && route.tab === "activity" && <ActivityList items={meta.activity} />}
     {meta && route.tab === "people" && <>
+      <ManageCollaborators place={place} meta={meta} me={me} refresh={refresh} />
       {meta.here.length > 0 && <><h2 className="section-title">Here now</h2><HereNow here={meta.here} /></>}
       <People here={meta.here} agents={meta.agents} groups={[
         { title: "Owners", names: meta.owners, note: `They manage ${place.space}.` },

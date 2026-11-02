@@ -13,7 +13,8 @@
 //   POST     /-/link/<space>     link a space to a GitHub account (or sync it, or unlink)
 //   GET      /-/live, /-/live.js live pages: a page's new rendering on every change (live.ts)
 //   GET      /, /<space>, /<space>/<project>, /-/app/*, /-/api/view, /-/api/me,
-//   POST     /-/api/chat         the hub's app: open-chat's interface over the hub (app.ts)
+//   POST     /-/api/chat, /-/api/collaborators
+//                                the hub's app: open-chat's interface over the hub (app.ts)
 //   *        /-/api/agenthub/... the orgs' worker agents, launched from a chat (agenthub.ts),
 //                                only with SPACEHUB_AGENTHUB_URL and _TOKEN set
 //   *        /-/api/xo/v1/...    xo.quirq.dev's store and agents (xo.ts), only

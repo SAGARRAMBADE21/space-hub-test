@@ -669,3 +669,12 @@ a.label:hover { text-decoration: none; filter: brightness(.96); }
 .label.goal-label { gap: 5px; }
 .label.goal-label .meter { background: var(--line-strong); }
 @media (max-width: 640px) { .goal-panel { padding: 14px; } .goal-text { font-size: 17px; } .meter.large { width: 40%; } }
+.collab-manage { display: grid; gap: 8px; max-width: 640px; margin: 4px 0 20px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); }
+.collab-add { display: flex; gap: 8px; min-width: 0; }
+.collab-list { display: grid; gap: 2px; margin: 4px 0 0; padding: 0; list-style: none; }
+.collab-list li { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 4px 0; }
+.collab-name { flex: 1; min-width: 0; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 520px) { .collab-add { flex-direction: column; } }
+.collab-bring { display: grid; gap: 6px; }
+.collab-bring-title { display: flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 12.5px; }
+.composer-note a { display: inline-flex; align-items: center; gap: 3px; color: var(--text-2); }

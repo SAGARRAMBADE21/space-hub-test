@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, FileText, Github, LogIn, Rocket, Square, UserRound, X } from "lucide-react";
+import { ArrowUp, Bot, FileText, Github, LogIn, Rocket, Square, UserRound, X } from "lucide-react";
 import { MAX_MESSAGE_LENGTH } from "@/lib/demo-chat";
 import { Markdown } from "@/components/content-view";
 import { useChat } from "@/hooks/use-chat";
 import { useLive } from "@/hooks/use-live";
 import { WorkerCard } from "@/components/worker-card";
 import { launchInput, launchOf, newKey, recentRepos, rememberRepo, repoName, send, type AgentHubStatus } from "@/lib/agenthub";
-import { type Place } from "@/api";
+import { placeUrl, type Place } from "@/api";
+import { hashOf, onLink } from "@/router";
 import { Ago, Avatar, AvatarStack, ErrorNote } from "@/ui/primitives";
 
 type Message = { id: string; role: string; author: string; content: string; links?: { label: string; path: string }[]; time?: string; detail?: string; saving?: boolean };
@@ -78,7 +79,7 @@ export function ChatView({ place, path, data, repliesPath, logExists, me, canWri
       {chat.sendError && <ErrorNote message={`Not saved. ${chat.sendError}`} />}
       {chat.error && chat.error !== "blocked" && <ErrorNote message={chat.error} retry={chat.refresh} />}
       {blocked === "signin" && <div className="composer-blocked"><span>Sign in to write in this conversation.</span><a className="button" href={signIn}><LogIn size={15} />Sign in</a></div>}
-      {blocked === "member" && <div className="composer-blocked"><span>Only members of {place.space} can write here. You can read along.</span></div>}
+      {blocked === "member" && <div className="composer-blocked"><span>Only people working on {place.space}/{place.project} can write here: owners and members of {place.space}, its collaborators and their agents. You can read along.</span></div>}
       {!blocked && <>
         {launching && <LaunchTray place={place} path={path} draft={chat.draft} onClose={() => setLaunching(false)} onLaunched={() => { setLaunching(false); chat.setDraft(""); chat.refresh(); onSaved(); }} />}
         {!added.length && chat.suggestions.length > 0 && <div className="suggestions">{chat.suggestions.map(item => <button key={item.label} type="button" disabled={!chat.ready || chat.pending} onClick={() => chat.send(item.prompt)}>{item.label}</button>)}</div>}
@@ -91,7 +92,7 @@ export function ChatView({ place, path, data, repliesPath, logExists, me, canWri
           {chat.pending ? <button type="button" className="send stop" aria-label="Stop the sample reply" onClick={chat.stop}><Square size={13} fill="currentColor" /></button>
             : <button type="submit" className="send" aria-label="Send" disabled={!chat.ready || !chat.draft.trim()}><ArrowUp size={17} /></button>}
         </form>
-        <p className="composer-note">Saved to {place.space}/{place.project} as {me}{chat.sampleReplies ? " · sample replies on" : ""} · Enter to send, Shift+Enter for a new line{canLaunch ? ` · Launch runs it as a worker of ${place.space}` : ""}</p>
+        <p className="composer-note">Saved to {place.space}/{place.project} as {me}{chat.sampleReplies ? " · sample replies on" : ""} · Enter to send, Shift+Enter for a new line{canLaunch ? ` · Launch runs it as a worker of ${place.space}` : ""}{place.project && <> · <a href={placeUrl(place, hashOf("people"))} onClick={onLink}><Bot size={12} />Bring your agent</a></>}</p>
       </>}
     </div>
   </div>;
