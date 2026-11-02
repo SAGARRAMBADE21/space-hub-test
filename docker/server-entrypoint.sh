@@ -32,6 +32,19 @@ if [ ! -w "$ROOT" ]; then
   exit 1
 fi
 
+# /data must outlive the container. Without a volume there, every redeploy
+# starts an empty hub with new signing keys: projects gone, every login
+# rejected ("Failed to verify token: 401"). Say so loudly, and with
+# SPACEHUB_REQUIRE_STORAGE=1 refuse to start at all.
+if ! awk -v dir="$ROOT" '$2 == dir { found = 1 } END { exit !found }' /proc/mounts 2>/dev/null; then
+  echo "spacehub: WARNING: $ROOT is not a mounted volume. Everything here is lost on the next redeploy." >&2
+  echo "spacehub: WARNING: mount persistent storage at $ROOT (on XO Launchpad: Persistent storage, path $ROOT)." >&2
+  if [ "${SPACEHUB_REQUIRE_STORAGE:-}" = 1 ]; then
+    echo "spacehub: SPACEHUB_REQUIRE_STORAGE=1, so refusing to start without it" >&2
+    exit 1
+  fi
+fi
+
 start_spacetime() {
   spacetime --root-dir "$ROOT" start --listen-addr "$INTERNAL" --non-interactive &
   server=$!

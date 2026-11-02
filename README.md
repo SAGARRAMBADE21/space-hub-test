@@ -426,6 +426,7 @@ Once the new hub is in use, delete the old database with
 | `SPACEHUB_XO_URL` | `https://xo.quirq.dev` | The xo server the website's "Sign in with xo" asks (`off`: no button). https, or http to this machine |
 | `SPACEHUB_AGENTHUB_URL`, `SPACEHUB_AGENTHUB_TOKEN` | unset | Turn on worker agents: members launch them from a chat, as tasks on this Agents Hub with this API token (see Agents launched from chat below) |
 | `SPACEHUB_AGENTHUB_SPACES` | unset | The orgs that have agents, comma-separated. Their members (and owners) launch and steer them; nobody else can |
+| `SPACEHUB_REQUIRE_STORAGE` | unset | `1`: refuse to start when `/data` is not a mounted volume, instead of only warning, so a deployment without persistent storage never serves a hub it will forget |
 | `/data` volume | | Databases, the server's signing keys, and the identity that owns the module. **Mount persistent storage here and back it up.** Without it, a restart forgets every project and invalidates every client token |
 
 The container starts as root only to take ownership of `/data`, because
