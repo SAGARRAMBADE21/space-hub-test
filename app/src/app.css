@@ -678,3 +678,57 @@ a.label:hover { text-decoration: none; filter: brightness(.96); }
 .collab-bring { display: grid; gap: 6px; }
 .collab-bring-title { display: flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 12.5px; }
 .composer-note a { display: inline-flex; align-items: center; gap: 3px; color: var(--text-2); }
+
+/* ---------------------------------------------------------------- the cowork chat, in XO Space's style
+   It is one conversation with the project's chat in XO Space (spacehub cowork xo), so it reads like it:
+   your messages are bubbles on the right, the coordinator's are prose under its name, notes are one quiet line. */
+.chat-xo { --xo-green: #487620; --xo-fill: #83D63A; --xo-fill-hover: #76C134; --xo-on-fill: #1E1E1E; --xo-bubble: var(--fill); }
+:root[data-theme="dark"] .chat-xo { --xo-green: #83D63A; --xo-fill-hover: #96DC58; --xo-on-fill: #141414; --xo-bubble: #262626; }
+.chat-xo .chat-head { gap: 12px; padding: 14px 20px; }
+.chat-xo .chat-head h2 { font-size: 17px; letter-spacing: -.01em; }
+.xo-tile { flex: none; display: grid; place-items: center; width: 30px; height: 30px; border-radius: 9px; border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+.xo-tile.big { width: 36px; height: 36px; border-radius: 10px; }
+.xo-tile .avatar, .xo-tile img { border-radius: 9px; }
+.xo-msgs { list-style: none; flex: 1; width: 100%; max-width: 760px; margin: 0 auto; padding: 24px 20px 12px; box-sizing: border-box; }
+.xo-empty { margin: 40px 0; text-align: center; color: var(--text-3); font-size: 13.5px; }
+.xo-msgs > li { margin: 0 0 22px; }
+.xo-msgs > li.cont { margin-top: -14px; }
+.xo-you { display: flex; flex-direction: column; align-items: flex-end; }
+.xo-bubble { max-width: min(80%, 540px); padding: 10px 16px; border-radius: 20px 20px 6px 20px; border: 1px solid var(--line); background: var(--xo-bubble); color: var(--text); font-size: 15px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.xo-you.cont .xo-bubble { border-top-right-radius: 8px; }
+.xo-you.is-pending .xo-bubble { opacity: .72; }
+.xo-meta { margin-top: 5px; padding-right: 4px; color: var(--text-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+.xo-them { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 14px; align-items: start; }
+.xo-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; min-height: 30px; padding-top: 5px; color: var(--text-3); font-size: 12px; }
+.xo-head b { color: var(--text); font-size: 13.5px; font-weight: 600; }
+.xo-body { min-width: 0; }
+.xo-prose { max-width: 66ch; color: var(--text); font-size: 15px; line-height: 1.65; }
+.xo-prose .markdown p { margin: 0 0 10px; }
+.xo-prose .markdown > :last-child { margin-bottom: 0; }
+.xo-shimmer { display: inline-block; background: linear-gradient(90deg, var(--text-3) 0%, var(--text-3) 35%, var(--text) 50%, var(--text-3) 65%, var(--text-3) 100%); background-size: 250% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: xo-shimmer 2.4s linear infinite; font-weight: 500; }
+@keyframes xo-shimmer { from { background-position: 100% 0; } to { background-position: -150% 0; } }
+.xo-ev { display: flex; align-items: center; gap: 12px; min-height: 22px; color: var(--text-3); font-size: 13px; }
+.xo-ev-ic { flex: none; display: grid; place-items: center; width: 22px; height: 22px; margin: 0 4px; border-radius: 50%; background: color-mix(in srgb, var(--xo-fill) 16%, transparent); color: var(--xo-green); }
+.xo-ev-t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.xo-ev time { flex: none; margin-left: auto; font: 11px/1 var(--mono); }
+.chat-xo .composer-wrap { border-top: 0; background: linear-gradient(to bottom, transparent, var(--panel) 18px); padding: 14px 20px 12px; }
+.chat-xo .composer-wrap > * { max-width: 720px; margin-left: auto; margin-right: auto; }
+.xo-composer { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; padding: 12px 8px 8px 18px; border: 1px solid var(--line-strong); border-radius: 22px; background: var(--bg); box-shadow: 0 8px 24px rgba(0, 0, 0, .12); }
+.xo-composer:focus-within { border-color: var(--line-strong); box-shadow: 0 8px 24px rgba(0, 0, 0, .12); }
+.xo-composer textarea { grid-column: 1 / -1; min-height: 28px; max-height: 200px; padding: 2px 8px 6px 0; font-size: 15px; line-height: 1.55; caret-color: var(--xo-green); scrollbar-width: none; }
+.xo-target { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--text-3); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.xo-target b { color: var(--text-2); font-weight: 600; }
+.xo-composer .send { width: 36px; height: 36px; border-radius: 50%; background: var(--xo-fill); color: var(--xo-on-fill); transition: transform 90ms; }
+.xo-composer .send:hover:not(:disabled) { background: var(--xo-fill-hover); }
+.xo-composer .send:active:not(:disabled) { transform: scale(.9); }
+.xo-composer .send:disabled { background: var(--fill); color: var(--text-3); }
+.chat-xo .composer-note { text-align: center; }
+@media (max-width: 600px) {
+  .xo-msgs { padding: 18px 16px 8px; }
+  .xo-bubble { max-width: 86%; }
+  .xo-them { grid-template-columns: 26px minmax(0, 1fr); gap: 10px; }
+  .xo-tile { width: 26px; height: 26px; }
+  .chat-xo .composer-wrap { padding: 12px 12px 10px; }
+  .xo-composer { padding: 12px 8px 8px 14px; border-radius: 20px; }
+}
+@media (prefers-reduced-motion: reduce) { .xo-shimmer { animation: none; color: var(--text-3); } }

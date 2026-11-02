@@ -22,6 +22,7 @@ import { cloneProject, findManifest, SpaceSync, writeManifest } from './spacesyn
 import { DEFAULT_HUB_HOST, githubTokenTarget, hubUrl, parseHubUrl, REMOTE } from './url';
 import { deviceSignIn } from './devicelogin';
 import { formatLine, formatState, linesSince, newPost, POST_KINDS, readChat, TASK_STATUSES, type CollabLine } from './collab';
+import { DEFAULT_XO_URL, type XoMeta, hubToXo, loadXoLink, saveXoLink, splitContent, xoSpace, xoToHub } from './coworkxo';
 import { addressedTo, briefing, coworkLinesSince, formatCoworkLine, formatCoworkState, loadProfile, newEnvelope, readCoworkChat, saveProfile, type CoworkLine } from './cowork';
 
 quietSdkLogs();
@@ -159,6 +160,9 @@ COWORK CHAT (collab/cowork.chat.*: each collaborator's own Cowork and its agents
   cowork inbox [<project>]                 What reached your cowork since you last looked  [--all] [--json]
   cowork watch [<project>]                 Print each new envelope  [--mine] [--since <seq>] [--json]
                                     [--exec <command>]: run it per envelope, as JSON in SPACEHUB_COWORK_POST
+  cowork xo [-p <project>]                 Link the cowork chat with the same project's chat in XO Space,
+                                    both ways, posting as you; the XO Space coordinator answers.
+                                    The project must exist on the hub.  [--xo-project <name>] [--xo-url <url>, default http://127.0.0.1:5002]
   Addresses: <cowork>, <cowork>:<agent>, @<builder> or *. You speak as --cowork / --agent, else
   SPACEHUB_COWORK / SPACEHUB_COWORK_AGENT, else what connect remembered.
 
@@ -1306,6 +1310,85 @@ async function coworkWatch(args: string[]) {
   await new Promise(() => {});
 }
 
+// One conversation in two places: this project's cowork chat and its chat in
+// XO Space, each carrying the other's messages (coworkxo.ts). The XO Space
+// project coordinator answers; everything comes back posted as you.
+async function coworkXo(args: string[]) {
+  const fullName = await resolveProject(opt(args, '-p', '--project'));
+  const xo = xoSpace(opt(args, '--xo-url') ?? process.env.XO_SPACE_URL ?? DEFAULT_XO_URL);
+  const xoProject = opt(args, '--xo-project') ?? fullName.split('/')[1];
+
+  // The cowork chat lives in the hub project, so the project has to be there first.
+  const { conn } = await open();
+  if (!(await findProject(conn, fullName))) {
+    die(`${fullName} is not on this hub, so it has no cowork chat to link. Create it first:\n  spacehub project create ${fullName} --source <folder> --push\nthen run this again.`);
+  }
+  const chats = await xo.projectChats();
+  const chat = chats.find(item => item.project === xoProject)
+    ?? die(`XO Space (${xo.url}) has no project named "${xoProject}". Its projects: ${chats.map(item => item.project).join(', ') || 'none'}. Pick one with --xo-project.`);
+
+  const me = await whoAmI();
+  const link = loadXoLink(fullName, xoProject);
+  const save = () => saveXoLink(fullName, xoProject, link);
+  const post = async (content: string, meta: XoMeta) => {
+    for (const part of splitContent(content)) {
+      const envelope = newEnvelope({ kind: 'message', cowork: '', agent: '', content: part, meta: JSON.stringify(meta) });
+      link.hubIds.push(envelope.id);
+      await conn.reducers.coworkPost({ project: fullName, ...envelope });
+    }
+  };
+
+  let defaultRef = '';
+  const fromHub = serialized(async () => {
+    const head = [...conn.db.gitRef.iter()].find(r => r.projectId === sp.id && r.name === defaultRef)?.oid;
+    if (!head) return;
+    const hub = await readCoworkChat(read, head);
+    // A first run starts from now: what was said before stays where it was said.
+    if (link.hubSeq === null || link.hubSeq > hub.state.seq) link.hubSeq = hub.state.seq;
+    for (const line of await coworkLinesSince(read, hub, link.hubSeq)) {
+      const text = hubToXo(line, me, link);
+      if (text) {
+        const sent = await xo.post(chat.id, text);
+        link.xoIds.push(sent.id);
+        note(`#${line.seq} from ${line.from} → XO Space ${xoProject}`);
+      }
+      link.hubSeq = line.seq;
+      save();
+    }
+  });
+  const fromXo = serialized(async () => {
+    if (link.xoSeq === null) link.xoSeq = await xo.latestSeq(chat.id);
+    for (const message of await xo.messagesAfter(chat.id, link.xoSeq)) {
+      const turn = xoToHub(message, link, xoProject);
+      if (turn) {
+        await post(turn.content, turn.meta);
+        note(`XO Space ${message.author_id} → ${fullName}`);
+      }
+      link.xoIds.push(message.id);
+      link.xoSeq = Math.max(link.xoSeq, message.seq);
+      save();
+    }
+  });
+
+  const { sp } = await followRefs(fullName, refName => {
+    if (refName === defaultRef) void fromHub();
+  });
+  defaultRef = `refs/heads/${sp.defaultBranch}`;
+  const read = hubObjects(conn, sp.id);
+  // The hub writes the cowork chat's files with its first post; a project with none yet gets this one, kept on the hub.
+  const head = (await listRefs(conn, sp.id)).find(r => r.name === defaultRef)?.oid;
+  if (!head || !(await readCoworkChat(read, head)).state.seq) {
+    await post(`Linked with the ${xoProject} project in XO Space: messages here and there are one conversation.`, { xo: { kind: 'note', project: xoProject } });
+    save();
+  }
+  await announce(fullName, 'watch');
+  note(`${fullName} cowork chat ⇄ XO Space ${xoProject} (${xo.url}), as ${me} (ctrl-c to stop)`);
+  void fromHub();
+  void fromXo();
+  setInterval(() => void fromXo(), 2000);
+  await new Promise(() => {});
+}
+
 // ---------------------------------------------------------------- spaces
 
 // Flags that take a value, so the first positional argument can be found
@@ -1843,7 +1926,7 @@ async function main() {
   }
 
   if (group === 'cowork') {
-    longLived = sub === 'watch';
+    longLived = sub === 'watch' || sub === 'xo';
     switch (sub) {
       case 'connect': return coworkConnect(args);
       case 'disconnect': return coworkDisconnect(args);
@@ -1863,8 +1946,9 @@ async function main() {
       case 'read': case 'log': return coworkRead(args);
       case 'inbox': return coworkInbox(args);
       case 'watch': return coworkWatch(args);
+      case 'xo': return coworkXo(args);
     }
-    die(`usage: spacehub cowork <connect|disconnect|status|context|say|ask|answer|delegate|accept|decline|progress|done|cancel|sync|share|read|inbox|watch>`);
+    die(`usage: spacehub cowork <connect|disconnect|status|context|say|ask|answer|delegate|accept|decline|progress|done|cancel|sync|share|read|inbox|watch|xo>`);
   }
 
   die(`unknown command "${group}"; see spacehub help`);

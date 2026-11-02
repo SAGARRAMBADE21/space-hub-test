@@ -1,7 +1,26 @@
 import { MAX_MESSAGE_LENGTH, type DemoMessage } from "./demo-chat";
 
 /** A chat turn saved on the hub: one JSON object per line of `<conversation>.log.jsonl`. */
-export type ChatTurn = DemoMessage & { author?: string; time?: string; detail?: string };
+/** `xo`: the line came through `spacehub cowork xo`, which says who wrote it in XO Space (owner, agent or note). */
+export type ChatTurn = DemoMessage & { author?: string; time?: string; detail?: string; note?: boolean; xo?: { kind: "owner" | "agent" | "note"; who: string; project: string } };
+
+const COWORK_NOTES: Record<string, string> = { connect: "connected", disconnect: "disconnected", status: "status" };
+
+/**
+ * A cowork chat line (collab/cowork.chat.log.jsonl) is signed by the person who
+ * owns the cowork, but the cowork wrote it: show it under the cowork's name, and
+ * show joining and leaving as notes rather than messages.
+ */
+function coworkTurn(value: Record<string, unknown>): Partial<ChatTurn> | undefined {
+  if (typeof value.seq !== "number" || typeof value.cowork !== "string" || !value.cowork) return;
+  const name = typeof value.agent === "string" && value.agent ? `${value.cowork}:${value.agent}` : value.cowork;
+  const type = typeof value.type === "string" ? value.type : "message";
+  const content = typeof value.content === "string" ? value.content.trim() : "";
+  if (COWORK_NOTES[type]) return { note: true, author: name, role: "assistant", content: `${name} ${COWORK_NOTES[type]}${content ? ": " + content : ""}` };
+  const parts = [typeof value.user === "string" && value.user ? `cowork of ${value.user}` : "cowork"];
+  if (type !== "message") parts.push(type);
+  return { author: name, role: "assistant", detail: parts.join(" · ") };
+}
 
 /** A project chat line (collab/chat.log.jsonl) says more: whom an agent works for, the kind of post, the task it moves. */
 function collabDetail(value: Record<string, unknown>): string | undefined {
@@ -13,6 +32,20 @@ function collabDetail(value: Record<string, unknown>): string | undefined {
   if (task && typeof task.id === "string") parts.push(["task " + task.id, typeof task.status === "string" ? task.status.replace("_", " ") : "", typeof task.owner === "string" ? "→ " + task.owner : ""].filter(Boolean).join(" "));
   if (Array.isArray(value.to) && value.to.length) parts.push("to " + value.to.filter(name => typeof name === "string").join(", "));
   return parts.length ? parts.join(" · ") : undefined;
+}
+
+/** A line `spacehub cowork xo` posted: signed by you on the hub, but the coordinator's words are the coordinator's. */
+function xoTurn(value: Record<string, unknown>): Partial<ChatTurn> | undefined {
+  const meta = object(value.meta) ? value.meta : undefined;
+  const xo = meta && object(meta.xo) ? meta.xo : undefined;
+  if (!xo || (xo.kind !== "owner" && xo.kind !== "agent" && xo.kind !== "note")) return;
+  const project = typeof xo.project === "string" ? xo.project : "";
+  const who = typeof xo.who === "string" ? xo.who : "";
+  const tag = { xo: { kind: xo.kind, who, project } } as const;
+  if (xo.kind === "note") return { ...tag, note: true };
+  if (xo.kind === "owner") return tag;
+  const author = !who || who === "project-coordinator" ? `${project} coordinator`.trim() : who;
+  return { ...tag, role: "assistant", author };
 }
 
 export const MAX_TURNS_PER_REQUEST = 2;
@@ -58,6 +91,8 @@ export function parseChatLog(content: string): ChatTurn[] {
       ...(typeof value.author === "string" ? { author: value.author } : {}),
       ...(typeof value.time === "string" ? { time: value.time } : {}),
       ...(collabDetail(value) ? { detail: collabDetail(value) } : {}),
+      ...coworkTurn(value),
+      ...xoTurn(value),
     });
   });
   return turns;

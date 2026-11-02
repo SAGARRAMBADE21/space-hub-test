@@ -59,7 +59,9 @@ async function handle() {
 
   if (post.cowork === me) return; // our own envelopes
   const owner = process.env.COWORK_BRIDGE_OWNER || '';
-  const forMe = (post.to ?? []).some(to => to === '*' || to === `@${owner}` || to.split(':')[0] === me) || post.delegation?.to?.split(':')[0] === me;
+  // A person's message with no recipients (what the app's cowork chat sends) is for the room, so answer it too.
+  const toRoom = post.type === 'message' && !post.cowork && post.role !== 'assistant' && !(post.to ?? []).length;
+  const forMe = toRoom || (post.to ?? []).some(to => to === '*' || to === `@${owner}` || to.split(':')[0] === me) || post.delegation?.to?.split(':')[0] === me;
 
   if (post.type === 'sync' && workdir) {
     try {

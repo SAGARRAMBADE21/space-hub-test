@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, Bot, FileText, Github, LogIn, Rocket, Square, UserRound, X } from "lucide-react";
+import { ArrowRight, ArrowUp, Bot, FileText, Github, Link2, LogIn, Rocket, Square, UserRound, X } from "lucide-react";
 import { MAX_MESSAGE_LENGTH } from "@/lib/demo-chat";
 import { Markdown } from "@/components/content-view";
 import { useChat } from "@/hooks/use-chat";
@@ -10,7 +10,7 @@ import { placeUrl, type Place } from "@/api";
 import { hashOf, onLink } from "@/router";
 import { Ago, Avatar, AvatarStack, ErrorNote } from "@/ui/primitives";
 
-type Message = { id: string; role: string; author: string; content: string; links?: { label: string; path: string }[]; time?: string; detail?: string; saving?: boolean };
+type Message = { id: string; role: string; author: string; content: string; links?: { label: string; path: string }[]; time?: string; detail?: string; saving?: boolean; xo?: { kind: string; who: string; project: string } };
 type Conversation = { title?: unknown; subtitle?: unknown; messages: Record<string, unknown>[] };
 
 const text = (value: unknown) => (typeof value === "string" ? value : "");
@@ -33,26 +33,41 @@ export function ChatView({ place, path, data, repliesPath, logExists, me, canWri
     links: Array.isArray(message.links) ? (message.links as Message["links"]) : undefined,
     time: text(message.time) || undefined,
   }));
-  const added: Message[] = chat.messages.map(turn => ({ ...turn, author: turn.author || (turn.role === "assistant" ? "quirqy" : "") }));
+  const added: Message[] = chat.messages.map(turn => ({ ...turn, role: turn.note ? "system" : turn.role, author: turn.author || (turn.role === "assistant" ? "quirqy" : "") }));
   const all = [...saved, ...added];
   const people = [...new Set(all.map(message => message.author).filter(name => name && name !== "note"))];
   // Members of an org with agents launch a worker with the message instead of only sending it.
   const agents = useLive<AgentHubStatus>(!blocked ? `/-/api/agenthub?space=${encodeURIComponent(place.space)}` : undefined, 0);
   const canLaunch = !!agents.data?.enabled && agents.data.allowed;
   const [launching, setLaunching] = useState(false);
+  // The cowork chat is linked with XO Space (spacehub cowork xo), so it looks like XO Space's own chat.
+  const xo = path.split("/").pop() === "cowork.chat.json";
+  const xoProject = [...all].reverse().find(message => message.xo?.project)?.xo?.project || place.project;
+  const now = useNow(xo ? 5000 : 0);
+  const last = [...all].reverse().find(message => message.role !== "system");
+  const lastAt = last?.time ? Date.parse(last.time) : NaN;
+  // Your message is the last word and recent: the coordinator is on it (its reply comes back through the link).
+  const replying = xo && !!last && isMine(last, me) && (!!last.saving || (now - lastAt >= -60_000 && now - lastAt < 3 * 60_000));
 
-  useEffect(() => { end.current?.scrollIntoView({ block: "end", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" }); }, [all.length, chat.pending]);
+  useEffect(() => { end.current?.scrollIntoView({ block: "end", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" }); }, [all.length, chat.pending, replying]);
   useEffect(() => {
     const box = input.current;
     if (box) { box.style.height = "auto"; box.style.height = Math.min(box.scrollHeight, 160) + "px"; }
   }, [chat.draft]);
 
-  return <div className="chat">
+  return <div className={`chat${xo ? " chat-xo" : ""}`}>
     {head && <div className="chat-head">
-      <div><h2>{text(data.title) || path.split("/").pop()}</h2>{text(data.subtitle) && <p>{text(data.subtitle)}</p>}</div>
-      {people.length > 0 && <AvatarStack names={people} />}
+      {xo ? <><span className="xo-tile big"><XoMark /></span><div><h2>{xoProject}</h2><p>Linked with XO Space · one conversation here and there</p></div></>
+        : <><div><h2>{text(data.title) || path.split("/").pop()}</h2>{text(data.subtitle) && <p>{text(data.subtitle)}</p>}</div>
+          {people.length > 0 && <AvatarStack names={people} />}</>}
     </div>}
-    <ol className="thread">
+    {xo ? <ol className="xo-msgs">
+      {all.length === 0 && <li className="xo-empty">No messages yet. Tell the {xoProject} coordinator what you would like done.</li>}
+      {all.map((message, index) => <XoRow key={message.id} message={message} cont={index > 0 && sameSpeaker(all[index - 1], message, me)} me={me} path={path} onOpen={onOpen} />)}
+      {replying && <li className="xo-them"><span className="xo-tile"><XoMark /></span><div className="xo-body"><div className="xo-head"><b>{xoProject} coordinator</b></div><div className="xo-shimmer">The coordinator is replying…</div></div></li>}
+      <div ref={end} />
+    </ol>
+    : <ol className="thread">
       {all.map((message, index) => {
         const previous = all[index - 1];
         const grouped = previous && previous.author === message.author && !message.time;
@@ -74,7 +89,7 @@ export function ChatView({ place, path, data, repliesPath, logExists, me, canWri
       })}
       {chat.pending && <li className="message-row"><span className="message-avatar"><Avatar name="quirqy" size={32} /></span><div className="message-main"><div className="message-meta"><strong>quirqy</strong></div><div className="typing" aria-label="Writing a reply"><i /><i /><i /></div></div></li>}
       <div ref={end} />
-    </ol>
+    </ol>}
     <div className="composer-wrap">
       {chat.sendError && <ErrorNote message={`Not saved. ${chat.sendError}`} />}
       {chat.error && chat.error !== "blocked" && <ErrorNote message={chat.error} retry={chat.refresh} />}
@@ -83,19 +98,66 @@ export function ChatView({ place, path, data, repliesPath, logExists, me, canWri
       {!blocked && <>
         {launching && <LaunchTray place={place} path={path} draft={chat.draft} onClose={() => setLaunching(false)} onLaunched={() => { setLaunching(false); chat.setDraft(""); chat.refresh(); onSaved(); }} />}
         {!added.length && chat.suggestions.length > 0 && <div className="suggestions">{chat.suggestions.map(item => <button key={item.label} type="button" disabled={!chat.ready || chat.pending} onClick={() => chat.send(item.prompt)}>{item.label}</button>)}</div>}
-        <form className="composer" onSubmit={event => { event.preventDefault(); chat.send(); }}>
-          <Avatar name={me!} size={28} />
-          <textarea ref={input} rows={1} maxLength={MAX_MESSAGE_LENGTH} aria-label={`Message ${place.space}/${place.project}`} placeholder={chat.ready ? placeholder : "Connecting…"} value={chat.draft}
+        <form className={`composer${xo ? " xo-composer" : ""}`} onSubmit={event => { event.preventDefault(); chat.send(); }}>
+          {!xo && <Avatar name={me!} size={28} />}
+          <textarea ref={input} rows={1} maxLength={MAX_MESSAGE_LENGTH} aria-label={`Message ${place.space}/${place.project}`} placeholder={!chat.ready ? "Connecting…" : xo ? `Message ${xoProject}…` : placeholder} value={chat.draft}
             onChange={event => chat.setDraft(event.target.value)}
             onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
+          {xo && <span className="xo-target"><ArrowRight size={13} />To the <b>{xoProject}</b> coordinator</span>}
           {canLaunch && !chat.pending && <button type="button" className={`launch${launching ? " on" : ""}`} aria-label="Launch a worker with this message" title="Launch a worker with this message" aria-pressed={launching} onClick={() => setLaunching(value => !value)}><Rocket size={16} /></button>}
           {chat.pending ? <button type="button" className="send stop" aria-label="Stop the sample reply" onClick={chat.stop}><Square size={13} fill="currentColor" /></button>
             : <button type="submit" className="send" aria-label="Send" disabled={!chat.ready || !chat.draft.trim()}><ArrowUp size={17} /></button>}
         </form>
-        <p className="composer-note">Saved to {place.space}/{place.project} as {me}{chat.sampleReplies ? " · sample replies on" : ""} · Enter to send, Shift+Enter for a new line{canLaunch ? ` · Launch runs it as a worker of ${place.space}` : ""}{place.project && <> · <a href={placeUrl(place, hashOf("people"))} onClick={onLink}><Bot size={12} />Bring your agent</a></>}</p>
+        {xo ? <p className="composer-note">Saved to {place.space}/{place.project} as {me} · Enter to send, Shift+Enter for a new line</p>
+        : <p className="composer-note">Saved to {place.space}/{place.project} as {me}{chat.sampleReplies ? " · sample replies on" : ""} · Enter to send, Shift+Enter for a new line{canLaunch ? ` · Launch runs it as a worker of ${place.space}` : ""}{place.project && <> · <a href={placeUrl(place, hashOf("people"))} onClick={onLink}><Bot size={12} />Bring your agent</a></>}</p>}
       </>}
     </div>
   </div>;
+}
+
+const isMine = (message: Message, me: string | null) => !!me && message.author === me && message.role !== "assistant" && message.role !== "system";
+const sameSpeaker = (a: Message, b: Message, me: string | null) => a.role !== "system" && b.role !== "system" && a.author === b.author && isMine(a, me) === isMine(b, me);
+
+function useNow(every: number) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!every) return;
+    const timer = setInterval(() => setNow(Date.now()), every);
+    return () => clearInterval(timer);
+  }, [every]);
+  return now;
+}
+
+const when = (time: string | undefined) => !time ? null : /^\d{4}-/.test(time) ? <Ago iso={time} /> : <span>{time}</span>;
+
+/** XO's mark: the two chevrons, the second in XO green. */
+function XoMark() {
+  return <svg viewBox="0 0 24 24" width="15" height="15" fill="none" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M4 6.5 9.5 12 4 17.5" stroke="currentColor" /><path d="M20 6.5 14.5 12l5.5 5.5" stroke="var(--xo-green)" />
+  </svg>;
+}
+
+/**
+ * One message in XO Space's style: yours a bubble on the right, the coordinator's
+ * and everyone else's prose under their name, notes one quiet line.
+ */
+function XoRow({ message, cont, me, path, onOpen }: { message: Message; cont: boolean; me: string | null; path: string; onOpen: (path: string) => void }) {
+  if (message.role === "system") return <li className="xo-ev"><span className="xo-ev-ic"><Link2 size={12} /></span><span className="xo-ev-t">{message.content}</span>{when(message.time)}</li>;
+  const links = message.links && message.links.length > 0 && <div className="message-links">{message.links.map((link, i) => <button key={i} type="button" onClick={() => onOpen(link.path)}><FileText size={14} />{link.label || link.path}</button>)}</div>;
+  if (isMine(message, me)) return <li className={`xo-you${cont ? " cont" : ""}${message.saving ? " is-pending" : ""}`}>
+    <div className="xo-bubble">{message.content}</div>
+    {links}
+    <div className="xo-meta">{message.saving ? "Sending…" : when(message.time)}</div>
+  </li>;
+  const agent = message.role === "assistant";
+  return <li className={`xo-them${cont ? " cont" : ""}`}>
+    <span className="xo-tile">{cont ? null : agent ? <XoMark /> : <Avatar name={message.author} size={30} />}</span>
+    <div className="xo-body">
+      {!cont && <div className="xo-head"><b>{message.author || "User"}</b>{message.detail && <span>{message.detail}</span>}{when(message.time)}</div>}
+      <div className="xo-prose"><Markdown content={message.content} filePath={path} navigate={onOpen} /></div>
+      {links}
+    </div>
+  </li>;
 }
 
 /**

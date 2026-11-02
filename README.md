@@ -384,6 +384,7 @@ spacehub cowork share api/conventions "snake_case, ISO 8601 UTC with Z, string i
 spacehub cowork sync --push "Error schema and pagination params"
 spacehub cowork watch --mine --exec ./on-envelope.sh
 node scripts/cowork-bridge.mjs acme/site sagar-laptop --workdir . --auto-accept   # plug a local runtime in
+spacehub cowork xo -p acme/site                 # one conversation with the site project's chat in XO Space (the project must exist on the hub)
 ```
 
 | File | Holds |
