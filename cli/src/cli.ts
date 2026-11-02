@@ -11,7 +11,7 @@ import readline from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import { configFile, githubLogin, loadConfig, removeToken, saveSettings, saveToken } from './config';
 import os from 'node:os';
-import { connect, connectTo, errorMessage, findSpace, findProject, findUser, hubProtocol, listRefs, projectsIn, PROTOCOL, quietSdkLogs, snapshot, spaceRoles, tables, type Conn } from './conn';
+import { connect, connectTo, errorMessage, findSpace, findProject, findUser, hubObjects, hubProtocol, listRefs, projectsIn, PROTOCOL, quietSdkLogs, snapshot, spaceRoles, tables, type Conn } from './conn';
 import { accountCheck, binDir, findOnPath, hubCheck, pathCheck, report, restartCheck, type Account, type Check } from './doctor';
 import { permissionHelp, spacesNamed } from './permission';
 import { AgentRun } from './agentrun';
@@ -21,6 +21,7 @@ import { git } from './git';
 import { cloneProject, findManifest, SpaceSync, writeManifest } from './spacesync';
 import { DEFAULT_HUB_HOST, githubTokenTarget, hubUrl, parseHubUrl, REMOTE } from './url';
 import { deviceSignIn } from './devicelogin';
+import { formatLine, formatState, linesSince, newPost, POST_KINDS, readChat, TASK_STATUSES, type CollabLine } from './collab';
 
 quietSdkLogs();
 
@@ -111,8 +112,27 @@ PROJECTS (alias: repo)
   project watch [<project>]                Stream ref changes live  [--exec <command>]
   project who [<project>]                  Who is connected to a project right now
   project member add [<project>] <builder>     Let one more builder push to this project
-  project member remove [<project>] <builder>  (a collaborator can remove itself)
+  project member add [<project>] <agent>       Bring your own agent to this project only
+                                    (you own the agent and work on the project)
+  project member remove [<project>] <name>     (a collaborator can remove itself; whoever
+                                    brought an agent can take it away; a collaborator's
+                                    agents leave with them)
   project member list [<project>]
+
+PROJECT CHAT (collab/ in the project: one conversation for its people and their agents)
+  collab post [-p <project>] <text>        Post as yourself (or as the agent you run as); "-" reads stdin
+                                    [--type message|goal|decision|finding|status|join]
+                                    [--to <name,...>] [--reply-to <id>] [--meta <json>] [--id <id>]
+  collab read [<project>]                  The conversation  [--since <seq>] [--last <n>] [--json]
+  collab state [<project>]                 Goal, tasks and owners, decisions, findings, who said what
+                                    [--json]
+  collab watch [<project>]                 Print each new post as it lands  [--since <seq>] [--json]
+                                    [--exec <command>]: run it per post, with the post as JSON
+                                    in SPACEHUB_COLLAB_POST
+  collab task [-p <project>] <id> [<note>] Open or update a task  [--title <text>]
+                                    [--status open|in_progress|blocked|done|cancelled]
+                                    [--owner <name> | --claim]
+  collab handoff [-p <project>] <id> <to> [<note>]   Hand a task to someone else on the project
 
   <project> is space/name, or just name for your personal space. Inside a clone
   it defaults to the repository's quirq remote. Older forms still work: space
@@ -862,7 +882,7 @@ async function projectMember(args: string[]) {
     const rows = await memberRows(conn, sp.id);
     const width = Math.max(sp.owner.length, ...rows.map(r => r.agent.length));
     out(`${sp.owner.padEnd(width)}  space`);
-    for (const r of rows) out(`${r.agent.padEnd(width)}  collaborator  added ${when(r.addedAt)}`);
+    for (const r of rows) out(`${r.agent.padEnd(width)}  collaborator  added ${when(r.addedAt)} by ${r.addedBy}`);
     return;
   }
   die(usage);
@@ -885,6 +905,122 @@ async function projectWho(args: string[]) {
   rows.sort((a, b) => a.agent.localeCompare(b.agent) || Number(a.since.microsSinceUnixEpoch - b.since.microsSinceUnixEpoch));
   const width = Math.max(...rows.map(r => r.agent.length));
   for (const r of rows) out(`${r.agent.padEnd(width)}  ${r.mode.padEnd(8)}  ${(r.projectId === 0n ? `(all of ${r.space})` : r.branch || '-').padEnd(12)}  since ${when(r.since)}`.trimEnd());
+}
+
+// ---------------------------------------------------------------- project chat
+
+// The project chat as it is on the hub now.
+async function hubChat(fullName: string) {
+  const sp = await requireProject(fullName);
+  const { conn } = await open();
+  const read = hubObjects(conn, sp.id);
+  const head = (await listRefs(conn, sp.id)).find(r => r.name === `refs/heads/${sp.defaultBranch}`)?.oid;
+  if (!head) die(`${fullName} has no commits yet`);
+  return { sp, conn, read, chat: await readChat(read, head) };
+}
+
+function printLine(line: CollabLine, json: boolean) {
+  out(json ? JSON.stringify(line) : formatLine(line));
+}
+
+async function sendPost(fullName: string, fields: Parameters<typeof newPost>[0], json: boolean) {
+  const post = newPost(fields);
+  const { conn } = await open();
+  await conn.reducers.collabPost({ project: fullName, ...post });
+  out(json ? JSON.stringify({ project: fullName, id: post.id }) : `posted to ${fullName}`);
+}
+
+function names(list: string | undefined) {
+  return (list ?? '').split(',').map(n => n.trim().toLowerCase()).filter(Boolean);
+}
+
+async function collabPost(args: string[]) {
+  const project = opt(args, '-p', '--project');
+  const kind = opt(args, '--type', '-t') ?? 'message';
+  const to = names(opt(args, '--to'));
+  const replyTo = opt(args, '--reply-to') ?? '';
+  const id = opt(args, '--id');
+  const meta = opt(args, '--meta') ?? '';
+  const json = bool(args, '--json');
+  if (!(POST_KINDS as readonly string[]).includes(kind) || kind === 'task' || kind === 'handoff') die(`--type is one of ${POST_KINDS.filter(k => k !== 'task' && k !== 'handoff').join(', ')} (tasks: spacehub collab task)`);
+  let content = args.join(' ');
+  if (content === '-') content = fs.readFileSync(0, 'utf8');
+  if (!content.trim() && kind !== 'join') die('usage: spacehub collab post [-p <project>] <text> [--type <kind>] [--to <names>]');
+  await sendPost(await resolveProject(project), { kind, content, to, replyTo, meta, ...(id ? { id } : {}) }, json);
+}
+
+async function collabTask(args: string[], handoff: boolean) {
+  const project = opt(args, '-p', '--project');
+  const title = opt(args, '--title') ?? '';
+  const status = opt(args, '--status') ?? '';
+  const ownerFlag = opt(args, '--owner');
+  const claim = bool(args, '--claim');
+  const json = bool(args, '--json');
+  if (status && !(TASK_STATUSES as readonly string[]).includes(status)) die(`--status is one of ${TASK_STATUSES.join(', ')}`);
+  const task = args.shift() ?? die(handoff ? 'usage: spacehub collab handoff [-p <project>] <task> <to> [<note>]' : 'usage: spacehub collab task [-p <project>] <task> [<note>] [--title <text>] [--status <status>] [--owner <name> | --claim]');
+  const owner = handoff ? (args.shift() ?? die('usage: spacehub collab handoff [-p <project>] <task> <to> [<note>]')).toLowerCase() : claim ? await whoAmI() : (ownerFlag ?? '').toLowerCase();
+  const fullName = await resolveProject(project);
+  await sendPost(fullName, { kind: handoff ? 'handoff' : 'task', task, taskTitle: title, taskStatus: status, taskOwner: owner, content: args.join(' ') }, json);
+}
+
+// The builder or agent this token signs in as.
+async function whoAmI() {
+  const { conn, identity } = await open();
+  const user = await findUser(conn, identity);
+  if (user) return user.username;
+  const agent = await snapshot(conn, tables.agent.where(a => a.identity.eq(identity)), () => [...conn.db.agent.iter()].find(a => a.identity.isEqual(identity)));
+  return agent?.name ?? die('not logged in; run: spacehub auth login');
+}
+
+async function collabRead(args: string[]) {
+  const since = Number(opt(args, '--since') ?? 0);
+  const last = opt(args, '--last');
+  const json = bool(args, '--json');
+  const fullName = await resolveProject(opt(args, '-p', '--project') ?? args[0]);
+  const { read, chat } = await hubChat(fullName);
+  let lines = await linesSince(read, chat, since);
+  if (last) lines = lines.slice(-Math.max(1, Number(last)));
+  if (!lines.length && !json) out(chat.state.seq ? `nothing after #${since}` : `nobody has posted in ${fullName} yet`);
+  for (const line of lines) printLine(line, json);
+}
+
+async function collabState(args: string[]) {
+  const json = bool(args, '--json');
+  const fullName = await resolveProject(opt(args, '-p', '--project') ?? args[0]);
+  const { chat } = await hubChat(fullName);
+  out(json ? JSON.stringify({ ...chat.state, recent_ids: undefined }, null, 2) : formatState(chat.state));
+}
+
+// Follow the default branch; each new post prints once, in order. After a
+// reconnect (or a restart with --since) it carries on from the last seen.
+async function collabWatch(args: string[]) {
+  const sinceArg = opt(args, '--since');
+  const command = opt(args, '--exec');
+  const json = bool(args, '--json');
+  const fullName = await resolveProject(opt(args, '-p', '--project') ?? args[0]);
+  let defaultRef = '';
+  let last = sinceArg === undefined ? -1 : Number(sinceArg);
+  const tick = serialized(async () => {
+    const head = [...conn.db.gitRef.iter()].find(r => r.projectId === sp.id && r.name === defaultRef)?.oid;
+    if (!head) return;
+    const chat = await readChat(read, head);
+    if (last < 0) last = chat.state.seq;
+    if (chat.state.seq <= last) return;
+    for (const line of await linesSince(read, chat, last)) {
+      printLine(line, json);
+      last = line.seq;
+      if (command) await new Promise<void>(resolve => spawn('sh', ['-c', command], { stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, SPACEHUB_COLLAB_POST: JSON.stringify(line) } }).on('close', () => resolve()).on('error', () => resolve()));
+    }
+  });
+  const { conn, sp } = await followRefs(fullName, refName => {
+    if (refName === defaultRef) void tick();
+  });
+  defaultRef = `refs/heads/${sp.defaultBranch}`;
+  const read = hubObjects(conn, sp.id);
+  await announce(fullName, 'watch');
+  note(`Watching the chat of ${fullName}${last >= 0 ? ` after #${last}` : ''} (ctrl-c to stop)`);
+  void tick();
+  await new Promise(() => {});
 }
 
 // ---------------------------------------------------------------- spaces
@@ -1408,6 +1544,19 @@ async function main() {
       case 'watch': return projectWatch(args);
     }
     die(`usage: spacehub space <create|list|view|edit|delete|member|link|clone|sync|who>`);
+  }
+
+  if (group === 'collab' || group === 'chat') {
+    longLived = sub === 'watch';
+    switch (sub) {
+      case 'post': case 'say': return collabPost(args);
+      case 'read': case 'log': return collabRead(args);
+      case 'state': return collabState(args);
+      case 'watch': return collabWatch(args);
+      case 'task': return collabTask(args, false);
+      case 'handoff': return collabTask(args, true);
+    }
+    die(`usage: spacehub collab <post|read|state|watch|task|handoff>`);
   }
 
   die(`unknown command "${group}"; see spacehub help`);

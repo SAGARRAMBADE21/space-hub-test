@@ -750,6 +750,10 @@ ${sp.description ? `<p class="desc">${esc(sp.description)}</p>` : ''}${this.buil
       case 'builder_cleared':
         line = `${who} removed the builder credit from ${project}`;
         break;
+      case 'collab_posted':
+        line = `${who} posted ${e.subject === 'message' ? '' : `a ${esc(e.subject)} `}in the chat of ${project}`;
+        more = esc(e.text);
+        break;
       case 'ref_created':
         line = `${who} created ${refKind} ${refLink} in ${project}`;
         more = pushed;

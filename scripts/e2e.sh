@@ -859,6 +859,51 @@ for t in "$AT" "$AT2"; do
   as alice spacehub space delete "$t" --yes >/dev/null
 done
 
+echo "project chat"
+ROOM="$ALICE/room"; BAG="scribe$RUN"; BW="$WORK/scribe-run"; RC="$WORK/room-bob"
+git init -q -b main "$WORK/src-room"; (cd "$WORK/src-room" && echo room >README.md && git add . && commit -m room)
+as alice spacehub project create "$ROOM" --source "$WORK/src-room" --push >/dev/null 2>&1
+as alice spacehub project create "$ALICE/elsewhere" >/dev/null 2>&1
+check "the owner adds a collaborator" as alice spacehub project member add "$ROOM" "$BOB"
+check "a collaborator makes an agent" as bob spacehub agent create "$BAG" -d "e2e scribe"
+expect_fail "others cannot bring someone's agent" "owners of the agent" as alice spacehub project member add "$ROOM" "$BAG"
+check "and brings it to this project only" as bob spacehub project member add "$ROOM" "$BAG"
+check "member list says who brought it" bash -c "SPACEHUB_HOME='$WORK/home-alice' spacehub project member list $ROOM | grep -q '^$BAG .*by $BOB'"
+BAG_TOKEN="$(as bob spacehub agent token "$BAG")"
+scribe() { env SPACEHUB_TOKEN="$BAG_TOKEN" SPACEHUB_HOME="$WORK/home-scribe" "$@"; }
+expect_fail "outsiders cannot post" "permission denied" as carol spacehub collab post -p "$ROOM" "let me in"
+(SPACEHUB_HOME="$WORK/home-alice" spacehub collab watch "$ROOM" --since 0 --json >"$WORK/chat-watch.out" 2>/dev/null) &
+BG="$BG $!"
+(env SPACEHUB_TOKEN="$BAG_TOKEN" SPACEHUB_HOME="$WORK/home-scribe" spacehub agent run "$BAG" "$BW" --interval 0.5 >"$WORK/scribe.log" 2>&1) &
+SR=$!; BG="$BG $SR"
+check "the owner sets the goal" as alice spacehub collab post -p "$ROOM" --type goal "Ship by Friday"
+check "and opens a task" as alice spacehub collab task -p "$ROOM" hero --title "Compress the hero image"
+check "the agent claims it" scribe spacehub collab task -p "$ROOM" hero --claim --status in_progress
+check "and reports a finding" scribe spacehub collab post -p "$ROOM" --type finding "hero.png is 4 MB"
+expect_fail "only a task's people change it" "Only $BAG" as bob spacehub collab task -p "$ROOM" hero --status done
+check "the agent hands it to its builder" scribe spacehub collab handoff -p "$ROOM" hero "$BOB" "resized, needs WebP"
+check "a post sent twice" scribe spacehub collab post -p "$ROOM" --id twice-1 --type status "waiting"
+check "is taken once" scribe spacehub collab post -p "$ROOM" --id twice-1 --type status "waiting"
+check "the builder closes it" as bob spacehub collab task -p "$ROOM" hero --status done "WebP shipped"
+same "every post is in the log once, in order" "$(as alice spacehub collab read "$ROOM" --json | python3 -c 'import json,sys; print(",".join(str(json.loads(l)["seq"]) for l in sys.stdin))')" "1,2,3,4,5,6,7"
+same "attributed to the agent and whom it works for" "$(as alice spacehub collab read "$ROOM" --json | python3 -c 'import json,sys; l=[json.loads(x) for x in sys.stdin][3]; print(l["agent"], l["user"], l["type"])')" "$BAG $BOB finding"
+check "the state folds the goal, tasks and people" bash -c "SPACEHUB_HOME='$WORK/home-alice' spacehub collab state $ROOM | grep -q 'hero  *done  *$BOB'"
+watched() { [[ "$(wc -l <"$WORK/chat-watch.out")" -ge 7 ]]; }
+check "watch prints every post as it lands" wait_for 20 watched
+in_folder() { [[ -f "$BW/$ALICE/room/collab/chat.log.jsonl" ]] && grep -q "WebP shipped" "$BW/$ALICE/room/collab/chat.log.jsonl"; }
+check "agent run checks out the project and its chat" wait_for 30 in_folder
+check "but not the rest of the space" test ! -e "$BW/$ALICE/elsewhere"
+as bob spacehub project clone "$ROOM" "$RC" -- -q 2>/dev/null
+(cd "$RC" && sed -i 's/WebP shipped/forged/' collab/chat.log.jsonl && commit -qam forge)
+expect_fail "pushes cannot rewrite the chat" "project chat" as bob git -C "$RC" push quirq main
+check "removing the collaborator" as alice spacehub project member remove "$ROOM" "$BOB"
+expect_fail "takes their agent too" "permission denied" scribe spacehub collab post -p "$ROOM" "still here?"
+dropped_room() { grep -q "$ROOM: no longer connected" "$WORK/scribe.log"; }
+check "and agent run stops following it" wait_for 20 dropped_room
+kill "$SR" 2>/dev/null; wait "$SR" 2>/dev/null || true
+as bob spacehub agent delete "$BAG" --yes >/dev/null
+for p in room elsewhere; do as alice spacehub project delete "$ALICE/$p" --yes >/dev/null; done
+
 echo "create from an existing repo, edit"
 P="$WORK/p"; git init -q -b main "$P"; (cd "$P" && echo p >p.txt && git add . && commit -m p)
 check "space create --source --push still makes a project (older form)" as alice spacehub space create proj --source "$P" --push

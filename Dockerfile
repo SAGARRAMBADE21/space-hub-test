@@ -97,6 +97,8 @@ COPY --from=module /src/module/dist/bundle.js /opt/spacehub/module.js
 COPY docker/server.Caddyfile /opt/spacehub/Caddyfile
 COPY docker/starting.Caddyfile /opt/spacehub/starting.Caddyfile
 COPY --chmod=755 docker/server-entrypoint.sh /usr/local/bin/spacehub-server
+# Backups of /data: spacehub-db backup | list | verify | restore (README, Back up and restore).
+COPY --chmod=755 scripts/spacehub-db /usr/local/bin/spacehub-db
 # The entrypoint starts as root only to take ownership of /data (platform
 # volumes usually mount root-owned), then runs everything as `spacetime`.
 # /data holds the databases, the server's signing keys and the identity that
@@ -106,6 +108,7 @@ ENV SPACEHUB_DB=spacehub \
     SPACEHUB_APP_DIR=/opt/spacehub/app \
     SPACETIME_ROOT=/data \
     SPACETIME_INTERNAL_PORT=3001 \
+    SPACEHUB_BACKUP_DIR=/backups \
     SPACEHUB_WEB_PORT=3002 \
     PORT=3000
 VOLUME ["/data"]

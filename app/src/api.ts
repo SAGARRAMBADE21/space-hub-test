@@ -110,6 +110,7 @@ const VERBS: Record<string, string> = {
   import_done: "imported", import_failed: "could not import", space_linked: "linked to GitHub:", space_unlinked: "unlinked from GitHub:",
   space_synced: "synced from GitHub:", space_sync_failed: "could not sync from GitHub:",
   agent_created: "created the agent", agent_deleted: "deleted the agent", agent_connected: "connected", agent_disconnected: "disconnected",
+  collab_posted: "posted in the chat of",
   builder_set: "credited a builder for", builder_cleared: "cleared the builder of",
 };
 

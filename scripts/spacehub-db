@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# spacehub-db: back up and restore a hub's data.
+#
+# Everything a hub is lives in SpacetimeDB's root directory (/data in the
+# server image): the databases (projects, git objects, chats, people), the
+# server's signing keys (lose them and every client token stops working) and
+# the identity that owns the module, which is the hub's admin. A backup is all
+# of it, as one archive with a manifest and a checksum.
+#
+#   spacehub-db backup  [--to <dir>] [--keep <n>]     archive the hub, running or stopped
+#   spacehub-db list    [--to <dir>]                  the archives there, newest first
+#   spacehub-db verify  <archive> [--load]            checksum and contents; --load boots it
+#                                                     in a throwaway server and counts its rows
+#   spacehub-db restore <archive> [--yes] [--discard-current]
+#                                                     put an archive back (the server must be stopped)
+#
+# A running server: the copy is taken while it serves, the append-only commit
+# log last, so the archive holds what a crash at that moment would have left,
+# which SpacetimeDB recovers from on start. Stopped: the copy is exact. Either
+# way, `verify --load` proves an archive opens before you need it.
+#
+# Restore refuses while a server holds the data directory (SpacetimeDB keeps a
+# lock on data/spacetime.pid, which other containers on the volume see too).
+# What was there is moved to <root>/.pre-restore-<time>/, not deleted, unless
+# --discard-current.
+#
+# Settings (the server image sets the first three):
+#   SPACETIME_ROOT            the data directory (/data)
+#   SPACEHUB_DB               the database name (spacehub)
+#   SPACETIME_INTERNAL_PORT   where the running server listens, for row counts (3001)
+#   SPACEHUB_BACKUP_DIR       where archives go (/backups)
+#   SPACEHUB_VERIFY_PORT      the throwaway server's port for verify --load (3399)
+set -euo pipefail
+
+ROOT="${SPACETIME_ROOT:-/data}"
+DB="${SPACEHUB_DB:-spacehub}"
+INTERNAL="127.0.0.1:${SPACETIME_INTERNAL_PORT:-3001}"
+BACKUPS="${SPACEHUB_BACKUP_DIR:-/backups}"
+VERIFY_PORT="${SPACEHUB_VERIFY_PORT:-3399}"
+# Counted into every manifest and checked by verify --load.
+TABLES=(user space project git_ref git_object project_member agent)
+# Caches, logs and the pid file are not data.
+EXCLUDES=(--exclude=./data/cache --exclude=./data/logs --exclude='./data/replicas/*/module_logs' --exclude=./data/spacetime.pid --exclude='./.pre-restore-*' --exclude='./.restore-*')
+
+# Temporary directories and a throwaway server, cleaned up however the script ends.
+TEMPS=()
+VERIFY_SERVER=""
+cleanup() {
+  if [[ -n "$VERIFY_SERVER" ]]; then kill "$VERIFY_SERVER" 2>/dev/null || true; wait "$VERIFY_SERVER" 2>/dev/null || true; fi
+  if [[ ${#TEMPS[@]} -gt 0 ]]; then rm -rf "${TEMPS[@]}"; fi
+}
+trap cleanup EXIT
+
+say() { printf 'spacehub-db: %s\n' "$*" >&2; }
+die() { say "$*"; exit 1; }
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# Is a SpacetimeDB server using this root right now?
+running() {
+  local pid="$ROOT/data/spacetime.pid"
+  [[ -e "$pid" ]] || return 1
+  ! flock -n "$pid" true 2>/dev/null
+}
+
+need_root() {
+  [[ -f "$ROOT/config/cli.toml" && -d "$ROOT/data/control-db" ]] || die "$ROOT is not a SpacetimeDB root directory (no config/cli.toml or data/control-db); set SPACETIME_ROOT"
+}
+
+# "n" from `spacetime sql ... SELECT COUNT(*) AS n`, or "?".
+count() { # count <server> <table> [root]
+  local out
+  out="$(spacetime --root-dir "${3:-$ROOT}" sql --server "http://$1" "$DB" "SELECT COUNT(*) AS n FROM $2" 2>/dev/null)" || { echo '?'; return; }
+  awk 'NR > 2 && $1 ~ /^[0-9]+$/ { print $1; exit }' <<<"$out" | grep . || echo '?'
+}
+
+counts_json() { # counts_json <server> [root]
+  local first=1 t
+  printf '{'
+  for t in "${TABLES[@]}"; do
+    [[ $first == 1 ]] || printf ', '
+    first=0
+    printf '"%s": "%s"' "$t" "$(count "$1" "$t" "${2:-$ROOT}")"
+  done
+  printf '}'
+}
+
+archive_ok() { # archive_ok <archive>: checksum, gzip, and the files a hub needs
+  local archive="$1" listing
+  [[ -f "$archive" ]] || die "no archive at $archive"
+  if [[ -f "$archive.sha256" ]]; then
+    (cd "$(dirname "$archive")" && sha256sum -c --status "$(basename "$archive").sha256") || die "$archive does not match its checksum; it is damaged"
+  else
+    say "no $(basename "$archive").sha256 beside it; checking the archive alone"
+  fi
+  listing="$(tar -tzf "$archive" 2>/dev/null)" || die "$archive is not a readable .tar.gz"
+  for f in ./MANIFEST ./config/cli.toml ./config/id_ecdsa ./config/id_ecdsa.pub ./data/control-db/ ./data/replicas/; do
+    grep -qxF "$f" <<<"$listing" || die "$archive lacks $f; it is not a spacehub backup"
+  done
+}
+
+cmd_backup() {
+  local keep=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --to) BACKUPS="${2:?--to needs a directory}"; shift 2 ;;
+      --keep) keep="${2:?--keep needs a number}"; shift 2 ;;
+      *) usage 1 ;;
+    esac
+  done
+  [[ -z "$keep" || "$keep" =~ ^[1-9][0-9]*$ ]] || die "--keep is a number of archives, 1 or more"
+  need_root
+  [[ -d "$BACKUPS" && -w "$BACKUPS" ]] || die "$BACKUPS is not a writable directory: mount one there (docker run -v ...:/backups) or pass --to <dir>"
+  case "$(cd "$BACKUPS" && pwd -P)/" in "$(cd "$ROOT" && pwd -P)/"*) die "$BACKUPS is inside $ROOT; keep backups on other storage" ;; esac
+
+  local stamp name tmp mode counts
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  name="spacehub-$DB-$stamp.tar.gz"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/spacehub-db.XXXXXX")"
+  TEMPS+=("$tmp")
+  if running; then
+    mode=online
+    counts="$(counts_json "$INTERNAL")"
+  else
+    mode=offline
+    counts='{}'
+  fi
+  say "backing up $ROOT ($mode) to $BACKUPS/$name"
+
+  # Everything but the commit logs first, then the commit logs: they only
+  # grow, so the copy holds every commit the earlier files refer to.
+  mkdir -p "$tmp/root"
+  tar -C "$ROOT" "${EXCLUDES[@]}" --exclude='./data/replicas/*/clog' -cf - . | tar -C "$tmp/root" -xf -
+  (cd "$ROOT" && find ./data/replicas -mindepth 2 -maxdepth 2 -name clog -type d -print0 2>/dev/null) |
+    while IFS= read -r -d '' clog; do
+      mkdir -p "$tmp/root/$clog"
+      tar -C "$ROOT/$clog" -cf - . | tar -C "$tmp/root/$clog" -xf -
+    done
+  cat >"$tmp/root/MANIFEST" <<EOF
+{
+  "format": "spacehub-db/1",
+  "database": "$DB",
+  "created": "$stamp",
+  "mode": "$mode",
+  "spacetime": "$(spacetime --version 2>/dev/null | sed -n 's/.*tool version \([^;]*\);.*/\1/p')",
+  "rows": $counts
+}
+EOF
+  tar -C "$tmp/root" -czf "$tmp/$name" .
+  mv "$tmp/$name" "$BACKUPS/$name.partial"
+  (cd "$tmp" && sha256sum "$BACKUPS/$name.partial" | sed "s|  .*|  $name|") >"$BACKUPS/$name.sha256"
+  mv "$BACKUPS/$name.partial" "$BACKUPS/$name"
+  archive_ok "$BACKUPS/$name"
+  say "done: $(du -h "$BACKUPS/$name" | cut -f1), rows $counts"
+  echo "$BACKUPS/$name"
+
+  if [[ -n "$keep" ]]; then
+    ls -1t "$BACKUPS"/spacehub-"$DB"-*.tar.gz 2>/dev/null | tail -n +"$((keep + 1))" | while read -r old; do
+      rm -f "$old" "$old.sha256"
+      say "removed $(basename "$old") (keeping the newest $keep)"
+    done
+  fi
+}
+
+cmd_list() {
+  [[ "${1:-}" == --to ]] && BACKUPS="${2:?--to needs a directory}"
+  local found=0 f
+  for f in $(ls -1t "$BACKUPS"/spacehub-*.tar.gz 2>/dev/null); do
+    found=1
+    printf '%s  %6s  %s\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)" "$(tar -xzOf "$f" ./MANIFEST 2>/dev/null | tr -d '\n' | sed -n 's/.*"mode": "\([a-z]*\)".*"rows": \({[^}]*}\).*/\1  \2/p')"
+  done
+  [[ $found == 1 ]] || say "no archives in $BACKUPS"
+}
+
+cmd_verify() {
+  local archive="" load=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --load) load=1; shift ;;
+      -*) usage 1 ;;
+      *) archive="$1"; shift ;;
+    esac
+  done
+  [[ -n "$archive" ]] || usage 1
+  archive_ok "$archive"
+  local manifest
+  manifest="$(tar -xzOf "$archive" ./MANIFEST)"
+  say "$archive: checksum and contents are good"
+  printf '%s\n' "$manifest"
+  [[ $load == 1 ]] || return 0
+
+  # Boot it on the side: a server of its own, on its own port and directory.
+  local tmp tries=0
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/spacehub-verify.XXXXXX")"
+  TEMPS+=("$tmp")
+  tar -C "$tmp" -xzf "$archive"
+  curl -sf "http://127.0.0.1:$VERIFY_PORT/v1/ping" >/dev/null 2>&1 && die "port $VERIFY_PORT is taken; set SPACEHUB_VERIFY_PORT to a free one"
+  spacetime --root-dir "$tmp" start --listen-addr "127.0.0.1:$VERIFY_PORT" --non-interactive >"$tmp/server.log" 2>&1 &
+  VERIFY_SERVER=$!
+  until curl -sf "http://127.0.0.1:$VERIFY_PORT/v1/ping" >/dev/null 2>&1; do
+    kill -0 "$VERIFY_SERVER" 2>/dev/null || { tail -5 "$tmp/server.log" >&2; die "the archive's server did not start"; }
+    tries=$((tries + 1)); [[ $tries -lt 300 ]] || die "the archive's server did not answer on port $VERIFY_PORT"
+    sleep 0.2
+  done
+  local t want got bad=0
+  for t in "${TABLES[@]}"; do
+    got="$(count "127.0.0.1:$VERIFY_PORT" "$t" "$tmp")"
+    want="$(tr -d '\n' <<<"$manifest" | sed -n "s/.*\"$t\": \"\([0-9?]*\)\".*/\1/p")"
+    if [[ "$got" == '?' ]]; then
+      say "  $t: could not be read"; bad=1
+    elif [[ -n "$want" && "$want" != '?' && "$got" -lt "$want" ]]; then
+      say "  $t: $got rows, but $want when backed up"; bad=1
+    else
+      say "  $t: $got rows${want:+ (backed up with $want)}"
+    fi
+  done
+  [[ $bad == 0 ]] || die "$archive opens, but not all of it reads back"
+  say "$archive opens and reads back"
+}
+
+cmd_restore() {
+  local archive="" yes=0 discard=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes | -y) yes=1; shift ;;
+      --discard-current) discard=1; shift ;;
+      -*) usage 1 ;;
+      *) archive="$1"; shift ;;
+    esac
+  done
+  [[ -n "$archive" ]] || usage 1
+  archive_ok "$archive"
+  running && die "a server is using $ROOT; stop it first (docker compose stop spacehub), then run restore in a one-off container on the same volume"
+  [[ -d "$ROOT" ]] || mkdir -p "$ROOT"
+  local stamp
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  if [[ $yes != 1 ]]; then
+    say "this replaces everything in $ROOT with $(basename "$archive") ($(tar -xzOf "$archive" ./MANIFEST | sed -n 's/.*"created": "\(.*\)".*/\1/p'))"
+    [[ $discard == 1 ]] && say "and deletes what is there now" || say "what is there now moves to $ROOT/.pre-restore-$stamp"
+    die "re-run with --yes to go ahead"
+  fi
+
+  # Unpack beside the data first, so a bad archive leaves the data alone.
+  local staging="$ROOT/.restore-$stamp" aside="$ROOT/.pre-restore-$stamp" entry
+  mkdir -p "$staging"
+  tar -C "$staging" -xzf "$archive" || { rm -rf "$staging"; die "could not unpack $archive; $ROOT is unchanged"; }
+  rm -f "$staging/MANIFEST"
+  mkdir -p "$aside"
+  shopt -s dotglob nullglob
+  for entry in "$ROOT"/*; do
+    case "$(basename "$entry")" in .pre-restore-* | .restore-*) continue ;; esac
+    mv "$entry" "$aside/"
+  done
+  mv "$staging"/* "$ROOT/"
+  rmdir "$staging"
+  shopt -u dotglob nullglob
+  if [[ $discard == 1 ]]; then
+    rm -rf "$aside"
+  elif [[ -z "$(ls -A "$aside")" ]]; then
+    rmdir "$aside"
+  else
+    say "the data that was there is in $aside; delete it once the hub works"
+  fi
+  # The server image runs as the spacetime user (uid 1000).
+  if [[ "$(id -u)" == 0 ]] && id spacetime >/dev/null 2>&1; then chown -R spacetime:spacetime "$ROOT"; fi
+  say "restored $(basename "$archive") into $ROOT; start the server (docker compose start spacehub)"
+}
+
+case "${1:-}" in
+  backup) shift; cmd_backup "$@" ;;
+  list | ls) shift; cmd_list "$@" ;;
+  verify) shift; cmd_verify "$@" ;;
+  restore) shift; cmd_restore "$@" ;;
+  -h | --help | help | "") usage 0 ;;
+  *) say "unknown command \"$1\""; usage 1 ;;
+esac
