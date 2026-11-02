@@ -9,7 +9,7 @@ import { launchInput, launchOf, newKey, recentRepos, rememberRepo, repoName, sen
 import { type Place } from "@/api";
 import { Ago, Avatar, AvatarStack, ErrorNote } from "@/ui/primitives";
 
-type Message = { id: string; role: string; author: string; content: string; links?: { label: string; path: string }[]; time?: string; saving?: boolean };
+type Message = { id: string; role: string; author: string; content: string; links?: { label: string; path: string }[]; time?: string; detail?: string; saving?: boolean };
 type Conversation = { title?: unknown; subtitle?: unknown; messages: Record<string, unknown>[] };
 
 const text = (value: unknown) => (typeof value === "string" ? value : "");
@@ -59,7 +59,7 @@ export function ChatView({ place, path, data, repliesPath, logExists, me, canWri
         return <li key={message.id} className={`message-row${grouped ? " grouped" : ""}${message.saving ? " saving" : ""}${me && message.author === me ? " mine" : ""}`}>
           <span className="message-avatar">{!grouped && (message.author ? <Avatar name={message.author} size={32} /> : <span className="avatar-anon"><UserRound size={18} /></span>)}</span>
           <div className="message-main">
-            {!grouped && <div className="message-meta"><strong>{!message.author ? "User" : message.author === me ? `${message.author} (you)` : message.author}</strong>{message.saving ? <span className="quiet">Saving…</span> : message.time && (/^\d{4}-/.test(message.time) ? <Ago iso={message.time} /> : <span className="quiet">{message.time}</span>)}</div>}
+            {!grouped && <div className="message-meta"><strong>{!message.author ? "User" : message.author === me ? `${message.author} (you)` : message.author}</strong>{message.detail && <span className="quiet">{message.detail}</span>}{message.saving ? <span className="quiet">Saving…</span> : message.time && (/^\d{4}-/.test(message.time) ? <Ago iso={message.time} /> : <span className="quiet">{message.time}</span>)}</div>}
             {(() => {
               const launch = launchOf(message.content);
               return <>

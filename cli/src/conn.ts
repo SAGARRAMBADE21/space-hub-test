@@ -5,6 +5,7 @@ import type { Identity, RowTypedQuery } from 'spacetimedb';
 import { loadConfig, saveToken } from './config';
 import { isDecodeError, protocolProblem, unreadableData, type HubProtocol } from './compat';
 import { PROTOCOL } from '../../module/src/protocol';
+import type { ObjectReader } from './collab';
 
 export { tables, PROTOCOL };
 export type Conn = DbConnection;
@@ -157,6 +158,25 @@ export function listRefs(conn: Conn, projectId: bigint) {
   return snapshot(conn, tables.gitRef.where(r => r.projectId.eq(projectId)), () =>
     [...conn.db.gitRef.iter()].filter(r => r.projectId === projectId).sort((a, b) => a.name.localeCompare(b.name))
   );
+}
+
+// A project's git objects, read from the hub one at a time (the project chat
+// reads a few small files this way; clones use the remote helper).
+export function hubObjects(conn: Conn, projectId: bigint): ObjectReader {
+  return async oid => {
+    const key = `${projectId}:${oid}`;
+    const row = await snapshot(conn, tables.gitObject.where(o => o.key.eq(key)), () => [...conn.db.gitObject.iter()].find(o => o.key === key));
+    if (!row) return null;
+    if (row.chunks === 0) return { kind: row.kind, data: row.data };
+    const data = new Uint8Array(Number(row.size));
+    for (let idx = 0; idx < row.chunks; idx++) {
+      const chunkKey = `${key}:${idx}`;
+      const chunk = await snapshot(conn, tables.objectChunk.where(c => c.key.eq(chunkKey)), () => [...conn.db.objectChunk.iter()].find(c => c.key === chunkKey));
+      if (!chunk) return null;
+      data.set(chunk.data, idx * 1024 * 1024);
+    }
+    return { kind: row.kind, data };
+  };
 }
 
 export function findUser(conn: Conn, identity: Identity) {

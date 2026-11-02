@@ -12,6 +12,11 @@
 # Clients: spacehub auth login --server wss://hub.example.com   (with the GitHub account gh is logged in to)
 # Admin (SQL, logs) stays inside the container:
 #   docker compose exec spacehub spacetime --root-dir /data logs --server http://127.0.0.1:3001 spacehub
+# Backups land in ./backups on the host (README, Back up and restore):
+#   docker compose exec spacehub spacehub-db backup --keep 14
+#   docker compose stop spacehub
+#   docker compose run --rm --no-deps --entrypoint spacehub-db spacehub restore /backups/<archive> --yes
+#   docker compose start spacehub
 services:
   spacehub:
     build:
@@ -29,6 +34,7 @@ services:
       SPACEHUB_AGENTHUB_SPACES: ${SPACEHUB_AGENTHUB_SPACES:-}
     volumes:
       - spacehub-data:/data
+      - ${SPACEHUB_BACKUP_HOST_DIR:-./backups}:/backups
     restart: unless-stopped
 
   proxy:

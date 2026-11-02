@@ -87,19 +87,14 @@ export interface AppendInput {
   read: (oid: string) => { kind: string; data: Uint8Array } | null;
 }
 
-/** Build the blob, trees and commit that append the turns; nothing is written here. */
-export function appendTurns(input: AppendInput): { commit: string; objects: NewObject[]; log: string; subject: string } {
-  checkTurns(input.turns);
-  const conversation = relativePath(input.conversation);
-  const log = chatLogPath(conversation);
-  if (!log) throw new ApiError("Open a conversation's .json file to save a chat.", 400);
-  if (!input.head) throw new ApiError('This project has no commits yet.', 400);
-  const read = (oid: string, kind: string) => {
-    const object = input.read(oid);
+// Look up `path` in the tree of commit `head`.
+function finder(read: AppendInput['read']) {
+  const get = (oid: string, kind: string) => {
+    const object = read(oid);
     if (!object || object.kind !== kind) throw new ApiError(`The hub is missing a ${kind}.`, 500);
     return object.data;
   };
-  const tree = (oid: string) => (oid ? parseTree(read(oid, 'tree')) : []);
+  const tree = (oid: string) => (oid ? parseTree(get(oid, 'tree')) : []);
   const find = (root: string, path: string) => {
     let entries = tree(root);
     const parts = path.split('/');
@@ -110,13 +105,81 @@ export function appendTurns(input: AppendInput): { commit: string; objects: NewO
       entries = tree(entry.oid);
     }
   };
-  const root = parseCommit(read(input.head, 'commit')).tree;
+  return { get, tree, find, root: (head: string) => parseCommit(get(head, 'commit')).tree };
+}
+
+/** A file of commit `head`: its entry and its text, or null when it is not there. */
+export function readFileAt(head: string, path: string, read: AppendInput['read']): { oid: string; text: string } | null {
+  const { get, find, root } = finder(read);
+  const entry = find(root(head), path);
+  if (!entry) return null;
+  if (!isFileMode(entry.mode)) throw new ApiError(`${path} is not a file.`, 409);
+  return { oid: entry.oid, text: decoder.decode(get(entry.oid, 'blob')) };
+}
+
+/** A file's new content, or an existing blob put at another path. */
+export type FileChange = Uint8Array | { oid: string };
+
+export interface CommitInput {
+  head: string;
+  changes: Record<string, FileChange>;
+  author: string;
+  now: number;
+  message: string;
+  read: AppendInput['read'];
+}
+
+/** Build the blobs, trees and commit that write `changes` on top of `head` (space.ts's commitFiles makes a first commit from scratch); nothing is written here. */
+export function editFiles(input: CommitInput): { commit: string; objects: NewObject[] } {
+  const objects: NewObject[] = [];
+  const made = new Map<string, NewObject>();
+  // Trees built here are read back while the next path is written.
+  const { tree, root } = finder(oid => made.get(oid) ?? input.read(oid));
+  const add = (kind: string, data: Uint8Array) => {
+    const oid = hashObject(kind, data);
+    if (!made.has(oid)) {
+      const object = { oid, kind, data };
+      made.set(oid, object);
+      objects.push(object);
+    }
+    return oid;
+  };
+  const replace = (treeOid: string, parts: string[], blob: string): string => {
+    const entries = tree(treeOid);
+    const [name, ...rest] = parts;
+    const current = entries.find(entry => entry.name === name);
+    if (rest.length && current && !isDirectoryMode(current.mode)) throw new ApiError(`${name} is not a folder.`, 409);
+    if (!rest.length && current && isDirectoryMode(current.mode)) throw new ApiError(`${name} is a folder.`, 409);
+    const entry: TreeEntry = rest.length
+      ? { mode: '40000', name, oid: replace(current && isDirectoryMode(current.mode) ? current.oid : '', rest, blob) }
+      : { mode: current?.mode ?? '100644', name, oid: blob };
+    return add('tree', serializeTree([...entries.filter(other => other.name !== name), entry]));
+  };
+  let newRoot = root(input.head);
+  for (const [path, change] of Object.entries(input.changes)) {
+    const blob = change instanceof Uint8Array ? add('blob', change) : change.oid;
+    newRoot = replace(newRoot, relativePath(path).split('/'), blob);
+  }
+  const who = `${input.author.replace(/[<>\n]/g, '')} <${input.author.replace(/[<>\n\s]/g, '')}@spacehub> ${Math.floor(input.now)} +0000`;
+  const commit = add('commit', encoder.encode(`tree ${newRoot}\nparent ${input.head}\nauthor ${who}\ncommitter ${who}\n\n${input.message}\n`));
+  return { commit, objects };
+}
+
+/** Build the blob, trees and commit that append the turns; nothing is written here. */
+export function appendTurns(input: AppendInput): { commit: string; objects: NewObject[]; log: string; subject: string } {
+  checkTurns(input.turns);
+  const conversation = relativePath(input.conversation);
+  const log = chatLogPath(conversation);
+  if (!log) throw new ApiError("Open a conversation's .json file to save a chat.", 400);
+  if (!input.head) throw new ApiError('This project has no commits yet.', 400);
+  const { get, find, root: rootOf } = finder(input.read);
+  const root = rootOf(input.head);
   const file = find(root, conversation);
   if (!file) throw new ApiError('The requested file or folder was not found.', 404);
   if (!isFileMode(file.mode)) throw new ApiError("Open a conversation's .json file to save a chat.", 400);
   let data: unknown;
   try {
-    data = JSON.parse(decoder.decode(read(file.oid, 'blob')));
+    data = JSON.parse(decoder.decode(get(file.oid, 'blob')));
   } catch {
     data = undefined;
   }
@@ -124,7 +187,7 @@ export function appendTurns(input: AppendInput): { commit: string; objects: NewO
 
   const existing = find(root, log);
   if (existing && !isFileMode(existing.mode)) throw new ApiError(`${log} is not a file a chat can be saved to.`, 409);
-  const before = existing ? decoder.decode(read(existing.oid, 'blob')) : '';
+  const before = existing ? decoder.decode(get(existing.oid, 'blob')) : '';
   const time = new Date(input.now * 1000).toISOString();
   const lines = input.turns
     .map(turn => JSON.stringify({ id: turn.id, role: turn.role, author: turn.role === 'user' ? input.author : 'quirqy', content: turn.content, ...(turn.links.length ? { links: turn.links } : {}), time }) + '\n')
@@ -132,27 +195,7 @@ export function appendTurns(input: AppendInput): { commit: string; objects: NewO
   const content = encoder.encode(before + (before && !before.endsWith('\n') ? '\n' : '') + lines);
   if (content.length > MAX_TEXT_BYTES) throw new ApiError('This chat log reached the 2 MB limit. Start a new conversation file.', 413);
 
-  const objects: NewObject[] = [];
-  const add = (kind: string, data: Uint8Array) => {
-    const oid = hashObject(kind, data);
-    objects.push({ oid, kind, data });
-    return oid;
-  };
-  const blob = add('blob', content);
-  const replace = (treeOid: string, parts: string[]): string => {
-    const entries = tree(treeOid);
-    const [name, ...rest] = parts;
-    const current = entries.find(entry => entry.name === name);
-    if (rest.length && current && !isDirectoryMode(current.mode)) throw new ApiError(`${name} is not a folder.`, 409);
-    const entry: TreeEntry = rest.length
-      ? { mode: '40000', name, oid: replace(current && isDirectoryMode(current.mode) ? current.oid : '', rest) }
-      : { mode: current?.mode ?? '100644', name, oid: blob };
-    return add('tree', serializeTree([...entries.filter(other => other.name !== name), entry]));
-  };
-  const newRoot = replace(root, log.split('/'));
-  const who = `${input.author.replace(/[<>\n]/g, '')} <${input.author.replace(/[<>\n\s]/g, '')}@spacehub> ${Math.floor(input.now)} +0000`;
   const subject = `chat: ${input.turns.length === 1 ? '1 message' : `${input.turns.length} messages`} in ${log}`;
-  const commit = add('commit', encoder.encode(`tree ${newRoot}\nparent ${input.head}\nauthor ${who}\ncommitter ${who}\n\n${subject}\n\nSaved from the hub's app.\n`));
-  return { commit, objects, log, subject };
+  const built = editFiles({ head: input.head, changes: { [log]: content }, author: input.author, now: input.now, message: `${subject}\n\nSaved from the hub's app.`, read: input.read });
+  return { ...built, log, subject };
 }
-

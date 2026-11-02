@@ -1,7 +1,19 @@
 import { MAX_MESSAGE_LENGTH, type DemoMessage } from "./demo-chat";
 
 /** A chat turn saved on the hub: one JSON object per line of `<conversation>.log.jsonl`. */
-export type ChatTurn = DemoMessage & { author?: string; time?: string };
+export type ChatTurn = DemoMessage & { author?: string; time?: string; detail?: string };
+
+/** A project chat line (collab/chat.log.jsonl) says more: whom an agent works for, the kind of post, the task it moves. */
+function collabDetail(value: Record<string, unknown>): string | undefined {
+  if (typeof value.seq !== "number") return;
+  const parts: string[] = [];
+  if (typeof value.agent === "string" && typeof value.user === "string" && value.user) parts.push(`agent of ${value.user}`);
+  if (typeof value.type === "string" && value.type !== "message") parts.push(value.type);
+  const task = object(value.task) ? value.task : undefined;
+  if (task && typeof task.id === "string") parts.push(["task " + task.id, typeof task.status === "string" ? task.status.replace("_", " ") : "", typeof task.owner === "string" ? "→ " + task.owner : ""].filter(Boolean).join(" "));
+  if (Array.isArray(value.to) && value.to.length) parts.push("to " + value.to.filter(name => typeof name === "string").join(", "));
+  return parts.length ? parts.join(" · ") : undefined;
+}
 
 export const MAX_TURNS_PER_REQUEST = 2;
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -45,6 +57,7 @@ export function parseChatLog(content: string): ChatTurn[] {
       ...(parsed ? { links: parsed } : {}),
       ...(typeof value.author === "string" ? { author: value.author } : {}),
       ...(typeof value.time === "string" ? { time: value.time } : {}),
+      ...(collabDetail(value) ? { detail: collabDetail(value) } : {}),
     });
   });
   return turns;

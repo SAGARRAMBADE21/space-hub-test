@@ -35,11 +35,12 @@ import { Identity, Timestamp } from 'spacetimedb';
 import { Sha1, objectHeader } from './sha1';
 import { CHUNK_SIZE, PRESENCE_STALE_SECONDS, commitParents, inSpace, memberKey, objectKey, ownsSpace, readObject, refKey, roleKey } from './store';
 import { renderUi } from './ui';
-import { ApiError, parseQuery, renderApi, templateFiles } from './workspace';
-import { appendTurns, type NewObject } from './chat';
+import { ApiError, parseCommit, parseQuery, parseTree, renderApi, templateFiles } from './workspace';
+import { appendTurns, editFiles, readFileAt, type FileChange, type NewObject } from './chat';
 import { commitFiles, instantiate } from './space';
 import { BUILTIN_TEMPLATE } from './spacetemplate';
 import { OLDEST_PROTOCOL, PROTOCOL } from './protocol';
+import { CHAT_FILE, CHAT_PATH, COLLAB_DIR, LOG_PATH, STATE_PATH, applyPost, parseState, postFiles, type Author, type PostIn } from './collab';
 
 const MAX_OBJECT_SIZE = 100 * 1024 * 1024;
 // Fetch windows are cut on `pos`, a running total of row weights per project.
@@ -370,6 +371,8 @@ const spacetimedb = schema({
 export default spacetimedb;
 
 type Ctx = ReducerCtx<InferSchema<typeof spacetimedb>>;
+type Project = NonNullable<ReturnType<Ctx['db']['project']['fullName']['find']>>;
+type GitRef = NonNullable<ReturnType<Ctx['db']['gitRef']['key']['find']>>;
 
 const ObjectIn = t.object('ObjectIn', {
   oid: t.string(),
@@ -388,6 +391,7 @@ const PROJECT_NAME = /^[A-Za-z0-9._-]{1,100}$/;
 const OID = /^[0-9a-f]{40}$/;
 const KINDS = new Set(['commit', 'tree', 'blob', 'tag']);
 const ZERO_OID = '';
+const REMOTE_HINT = 'quirq';
 
 // The hub admin acting for a space that mirrors GitHub (the web service's
 // sync). Shown in the activity feed as "GitHub sync".
@@ -449,12 +453,17 @@ function requireProjectAdmin(ctx: Ctx, fullName: string) {
   return row;
 }
 
+// Who may push to a project: its space's owners and members, and its
+// collaborators (builders, and agents they brought).
+function canWrite(ctx: Ctx, sp: { id: bigint; owner: string }, name: string | null) {
+  return isMember(ctx, sp.owner, name) || (!!name && !!ctx.db.projectMember.key.find(memberKey(sp.id, name)));
+}
+
 // Pushes: the space's owners and members, and the project's collaborators.
 function requireWritable(ctx: Ctx, fullName: string) {
   const row = requireProject(ctx, fullName);
   const me = actorName(ctx);
-  if (isMember(ctx, row.owner, me) || isSyncer(ctx, row.owner)) return row;
-  if (me && ctx.db.projectMember.key.find(memberKey(row.id, me))) return row;
+  if (canWrite(ctx, row, me) || isSyncer(ctx, row.owner)) return row;
   throw new SenderError(`permission denied: you are not an owner or member of "${row.owner}", nor a collaborator on "${fullName}"`);
 }
 
@@ -971,6 +980,8 @@ export const updateRef = spacetimedb.reducer(
     } else if (current && current.oid !== newOid) {
       fastForward = isBranch && isAncestor(ctx, sp.id, current.oid, newOid);
     }
+    // After the usual checks, so a race still reads as a stale or non-fast-forward push.
+    guardCollab(ctx, sp, name, current?.oid ?? '', newOid, force);
     if (current) {
       ctx.db.gitRef.id.update({ ...current, oid: newOid, updatedAt: ctx.timestamp, updatedBy: ctx.sender });
     } else {
@@ -1012,6 +1023,15 @@ export const appendChat = spacetimedb.reducer(
   (ctx, { project: fullName, conversation, turns }) => {
     const sp = requireWritable(ctx, fullName);
     const me = requireActor(ctx);
+    // The project chat takes app messages as posts, attributed by the hub.
+    if (conversation.replace(/^\/+/, '') === CHAT_PATH) {
+      for (const turn of turns) {
+        if (turn.role !== 'user') throw new SenderError('The project chat takes your own messages; agents post as themselves.');
+        postToCollab(ctx, sp, { id: turn.id, kind: 'message', content: turn.content, to: [], replyTo: '', task: '', taskTitle: '', taskStatus: '', taskOwner: '', meta: '' });
+      }
+      return;
+    }
+    if (conversation.replace(/^\/+/, '').startsWith(`${COLLAB_DIR}/`)) throw new SenderError(`Only ${CHAT_PATH} takes messages in ${COLLAB_DIR}/.`);
     const name = `refs/heads/${sp.defaultBranch}`;
     const current = ctx.db.gitRef.key.find(refKey(sp.id, name));
     let built: ReturnType<typeof appendTurns>;
@@ -1027,14 +1047,112 @@ export const appendChat = spacetimedb.reducer(
     } catch (err) {
       throw new SenderError(err instanceof Error ? err.message : String(err));
     }
-    let added = 0n;
-    for (const object of built.objects) added += writeObject(ctx, sp, object);
-    ctx.db.gitRef.id.update({ ...current!, oid: built.commit, updatedAt: ctx.timestamp, updatedBy: ctx.sender });
-    ctx.db.project.id.update({ ...sp, pushedAt: ctx.timestamp });
-    grow(ctx, sp.id, added);
+    commitToDefault(ctx, sp, current!, built);
     logActivity(ctx, { projectId: sp.id, path: sp.fullName, kind: 'ref_updated', subject: name, oid: built.commit, count: 1, text: built.subject });
   }
 );
+
+// Store a commit built here (chat.ts) and move the default branch to it.
+function commitToDefault(ctx: Ctx, sp: Project, current: GitRef, built: { commit: string; objects: NewObject[] }) {
+  let added = 0n;
+  for (const object of built.objects) added += writeObject(ctx, sp, object);
+  ctx.db.gitRef.id.update({ ...current, oid: built.commit, updatedAt: ctx.timestamp, updatedBy: ctx.sender });
+  ctx.db.project.id.update({ ...sp, pushedAt: ctx.timestamp });
+  grow(ctx, sp.id, added);
+}
+
+// ---------------------------------------------------------------- project chat
+
+// The project chat (collab.ts): every collaborator and the agents they
+// bring post here, and each post is one commit to collab/ on the default
+// branch, made by the hub as the poster. Being a reducer, posts are
+// serialized: no locks, no lost lines, and a post's id makes resending it
+// harmless.
+export const collabPost = spacetimedb.reducer(
+  {
+    project: t.string(),
+    id: t.string(),
+    kind: t.string(),
+    content: t.string(),
+    to: t.array(t.string()),
+    replyTo: t.string(),
+    task: t.string(),
+    taskTitle: t.string(),
+    taskStatus: t.string(),
+    taskOwner: t.string(),
+    meta: t.string(),
+  },
+  (ctx, { project: fullName, ...post }) => {
+    postToCollab(ctx, requireWritable(ctx, fullName), post);
+  }
+);
+
+// Who is posting: a builder, or an agent and whom it works for (the
+// collaborator who brought it to this project, else the space that owns it).
+function collabAuthor(ctx: Ctx, sp: Project): Author {
+  const me = requireActor(ctx);
+  if (ctx.db.user.identity.find(ctx.sender)) return { name: me, kind: 'builder', user: me };
+  const brought = ctx.db.projectMember.key.find(memberKey(sp.id, me));
+  return { name: me, kind: 'agent', user: brought?.addedBy ?? ctx.db.space.name.find(me)?.parent ?? '' };
+}
+
+function postToCollab(ctx: Ctx, sp: Project, post: PostIn) {
+  const author = collabAuthor(ctx, sp);
+  const name = `refs/heads/${sp.defaultBranch}`;
+  const current = ctx.db.gitRef.key.find(refKey(sp.id, name));
+  if (!current) throw new SenderError(`"${sp.fullName}" has no commits on ${sp.defaultBranch} yet; push one before chatting`);
+  const read = (oid: string) => readObject(ctx.db, sp.id, oid);
+  const now = Number(ctx.timestamp.microsSinceUnixEpoch / 1_000_000n);
+  const time = new Date(Number(ctx.timestamp.microsSinceUnixEpoch / 1000n)).toISOString();
+  try {
+    const log = readFileAt(current.oid, LOG_PATH, read);
+    const before = parseState(readFileAt(current.oid, STATE_PATH, read)?.text);
+    const applied = applyPost(before, post, author, {
+      time,
+      admin: isOwner(ctx, sp.owner, author.name),
+      isParticipant: who => canWrite(ctx, sp, who),
+    });
+    if (!applied) return; // already posted
+    const { files, moved } = postFiles(log?.text ?? '', before, applied);
+    const encoder = new TextEncoder();
+    const changes: Record<string, FileChange> = {};
+    if (moved && log) changes[moved.to] = { oid: log.oid };
+    for (const [path, text] of Object.entries(files)) changes[path] = encoder.encode(text);
+    if (!readFileAt(current.oid, CHAT_PATH, read)) changes[CHAT_PATH] = encoder.encode(CHAT_FILE);
+    const subject = `collab: ${post.kind} #${applied.line.seq} from ${author.name}`;
+    const built = editFiles({ head: current.oid, changes, author: author.name, now, message: `${subject}\n\nPosted to the project chat (${LOG_PATH}).`, read });
+    commitToDefault(ctx, sp, current, built);
+    logActivity(ctx, { projectId: sp.id, path: sp.fullName, kind: 'collab_posted', subject: post.kind, oid: built.commit, count: applied.line.seq, text: applied.line.content || applied.line.task?.title || '' });
+  } catch (err) {
+    if (err instanceof SenderError) throw err;
+    throw new SenderError(err instanceof Error ? err.message : String(err));
+  }
+}
+
+// The tree id of collab/ in a commit ("" when it has none).
+function collabTreeOf(ctx: Ctx, projectId: bigint, commitOid: string) {
+  if (!commitOid) return '';
+  const commit = readObject(ctx.db, projectId, commitOid);
+  if (!commit || commit.kind !== 'commit') return '';
+  const root = readObject(ctx.db, projectId, parseCommit(commit.data).tree);
+  if (!root || root.kind !== 'tree') return '';
+  return parseTree(root.data).find(entry => entry.name === COLLAB_DIR)?.oid ?? '';
+}
+
+// collab/ on the default branch changes only through collabPost, so pushes
+// cannot rewrite or forge the chat. Owners of the project's space may
+// replace it (a force push, or the branch's first push), to repair it.
+function guardCollab(ctx: Ctx, sp: Project, ref: string, oldOid: string, newOid: string, force: boolean) {
+  const defaultRef = `refs/heads/${sp.defaultBranch}`;
+  const becomesDefault = !ctx.db.gitRef.key.find(refKey(sp.id, defaultRef)) && ref.startsWith('refs/heads/');
+  if (ref !== defaultRef && !becomesDefault) return;
+  if (collabTreeOf(ctx, sp.id, oldOid) === collabTreeOf(ctx, sp.id, newOid)) return;
+  if (isSyncer(ctx, sp.owner)) return;
+  if (isOwner(ctx, sp.owner, actorName(ctx)) && (force || !oldOid)) return;
+  throw new SenderError(
+    `${COLLAB_DIR}/ is the project chat and changes only through "spacehub collab post"; undo your changes to ${COLLAB_DIR}/ (git checkout ${REMOTE_HINT}/${sp.defaultBranch} -- ${COLLAB_DIR}) and push again`
+  );
+}
 
 // ---------------------------------------------------------------- spaces
 
@@ -1300,12 +1418,19 @@ export const recordRefSync = spacetimedb.reducer(
 // ---------------------------------------------------------------- collaborators
 
 // Let one more builder (or agent) push to one project: a collaborator.
-// Adding one twice is a no-op.
+// The space's owners add builders. Anyone who works on the project brings
+// their own agents to it (this project only): owners and members of the
+// space, and collaborators. Adding one twice is a no-op.
 export const addProjectMember = spacetimedb.reducer({ project: t.string(), agent: t.string() }, (ctx, { project: fullName, agent }) => {
-  const sp = requireProjectAdmin(ctx, fullName);
+  const sp = requireProject(ctx, fullName);
+  const me = actorName(ctx);
+  const admin = isOwner(ctx, sp.owner, me) || isSyncer(ctx, sp.owner);
   const name = agent.trim().toLowerCase();
-  if (requireMemberName(ctx, name) === 'agent' && !isOwner(ctx, name, actorName(ctx))) {
-    throw new SenderError(`permission denied: only the owners of the agent "${name}" connect it`);
+  if (requireMemberName(ctx, name) === 'agent') {
+    if (!isOwner(ctx, name, me)) throw new SenderError(`permission denied: only the owners of the agent "${name}" connect it`);
+    if (!admin && !canWrite(ctx, sp, me)) throw new SenderError(`permission denied: only people working on "${fullName}" bring their agents to it`);
+  } else if (!admin) {
+    throw new SenderError(`permission denied: only owners of "${sp.owner}" change "${fullName}"`);
   }
   if (isMember(ctx, sp.owner, name)) throw new SenderError(`${name} belongs to "${sp.owner}" and can already push to "${sp.fullName}"`);
   const key = memberKey(sp.id, name);
@@ -1314,18 +1439,27 @@ export const addProjectMember = spacetimedb.reducer({ project: t.string(), agent
   logActivity(ctx, { kind: 'project_member_added', projectId: sp.id, path: sp.fullName, subject: name });
 });
 
-// A space owner removes a collaborator, or a collaborator leaves.
+// A space owner removes a collaborator, or a collaborator leaves. An agent
+// also goes when whoever brought it, or its owners, take it away. Agents a
+// collaborator brought leave with them.
 export const removeProjectMember = spacetimedb.reducer({ project: t.string(), agent: t.string() }, (ctx, { project: fullName, agent }) => {
   const sp = requireProject(ctx, fullName);
   const name = agent.trim().toLowerCase();
   const me = actorName(ctx);
-  if (!isOwner(ctx, sp.owner, me) && me !== name) {
+  const row = ctx.db.projectMember.key.find(memberKey(sp.id, name));
+  const mayRemove = isOwner(ctx, sp.owner, me) || me === name || (!!row && (row.addedBy === me || isOwner(ctx, name, me)));
+  if (!mayRemove) {
     throw new SenderError(`permission denied: only owners of "${sp.owner}" remove collaborators on "${fullName}"`);
   }
-  const row = ctx.db.projectMember.key.find(memberKey(sp.id, name));
   if (!row) throw new SenderError(`${name} is not a collaborator on "${sp.fullName}"`);
   ctx.db.projectMember.id.delete(row.id);
   logActivity(ctx, { kind: 'project_member_removed', projectId: sp.id, path: sp.fullName, subject: name });
+  if (ctx.db.space.name.find(name)?.kind === 'agent') return;
+  for (const brought of [...ctx.db.projectMember.projectId.filter(sp.id)]) {
+    if (brought.addedBy !== name || ctx.db.space.name.find(brought.agent)?.kind !== 'agent' || canWrite(ctx, sp, name)) continue;
+    ctx.db.projectMember.id.delete(brought.id);
+    logActivity(ctx, { kind: 'project_member_removed', projectId: sp.id, path: sp.fullName, subject: brought.agent, text: `brought by ${name}` });
+  }
 });
 
 // ---------------------------------------------------------------- presence

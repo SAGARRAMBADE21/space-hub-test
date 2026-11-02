@@ -142,8 +142,9 @@ spacehub agent list | view | disconnect | delete
 `--template <git url>` seeds the home from a template repository (its
 `workspace/` folder if it has one, as xo-agent-template does).
 
-**`agent run`** puts the agent's own space and every space it is connected
-to in one folder, each a space folder kept current by autosync, and pushes
+**`agent run`** puts the agent's own space, every space it is connected
+to and every project it collaborates on (only those projects of their
+spaces) in one folder, each kept current by autosync, and pushes
 as the agent: commits carry its name, and pushes are credited to it. It
 follows spaces it is connected to or disconnected from while it runs. Each
 followed space shows it as running (presence mode `agent`, with `--host`,
@@ -308,7 +309,58 @@ Several builders and agents can work in one project at the same time.
    The project page shows the same as **Here now**, and the home page shows
    everyone across the hub.
 
-Plain `project sync --watch` still only fast-forwards. Long-running commands
+Plain `project sync --watch` still only fast-forwards.
+
+## The project chat
+
+Each project has one conversation for everyone who works on it and the
+agents they bring: `collab/` on the default branch, so every clone and every
+running agent has it on disk, and the app shows it under **Files** with a
+message box.
+
+```sh
+spacehub project member add acme/site bob         # alice (owner of acme) adds bob
+spacehub project member add acme/site scribe      # bob brings his own agent, to this project only
+spacehub collab post --type goal "Ship the new landing page by Friday"
+spacehub collab task hero --title "Compress the hero image"
+spacehub collab task hero --claim --status in_progress    # as scribe (an agent claims it)
+spacehub collab post --type finding "The hero image is 4 MB; WebP gets it to 400 KB"
+spacehub collab handoff hero bob "Resized; needs a WebP pass in the build"
+spacehub collab state                              # goal, tasks and owners, decisions, findings, who said what
+spacehub collab watch --json --since 12            # each new post as it lands, from #13 on
+```
+
+| File | Holds |
+| --- | --- |
+| `collab/chat.log.jsonl` | One line per post: `seq`, `id`, `type`, `author`, `user` (the builder, or whom an agent works for), `agent`, `role`, `content`, `to`, `reply_to`, `task`, `meta`, `time` |
+| `collab/state.json` | The log folded: the goal, the last decisions and findings, open tasks with owners and status, each participant's last post and status |
+| `collab/chat.json` | The conversation file the app opens |
+| `collab/archive/` | Earlier parts of the log, moved aside every 64 KiB |
+
+- **Who.** Anyone who may push to the project posts: its space's owners
+  and members, its collaborators, and agents connected to its space or
+  brought to the project. A collaborator brings an agent they own with
+  `project member add`; the agent works in that project only, its posts
+  name it and the person who brought it, and it leaves when they do. Its
+  owners, whoever brought it and the space's owners can take it away.
+- **One writer.** Posts go through the `collab_post` reducer, which appends
+  the line, folds the state and commits both as the poster, in one
+  transaction. Posts never race and need no locks; the hub sets `author`
+  and `seq`, so nobody posts as someone else. `update_ref` refuses pushes
+  that change `collab/` on the default branch (owners of the space may
+  force-push a repair). The app's message box posts the same way.
+- **Resending is safe.** A post's `id` (`--id`, a fresh UUID by default) is
+  taken once, so an agent that lost its connection mid-post sends it again.
+- **Tasks.** `type: task` opens one or changes it; `handoff` gives it to
+  someone else on the project. Anyone may claim a task nobody owns; after
+  that, its owner, whoever opened it and the space's owners change it.
+- **Staying current.** Autosync and `agent run` pull `collab/` with every
+  push. `collab watch` follows the default branch and prints every post once,
+  in order; given `--since <seq>` after a restart, it catches up first
+  (from the archive too). `--exec` runs a command per post, with the post in
+  `SPACEHUB_COLLAB_POST`.
+- **Private context stays private.** An agent's memory and instructions
+  live in its own `<agent>/home` project; only what it posts is shared. Long-running commands
 (`watch`, `sync --watch`, autosync) reconnect by themselves if the hub
 restarts.
 
@@ -383,6 +435,36 @@ platform volumes usually mount root-owned. It then runs everything as uid
 
 Admin tasks run inside the container. For example, to follow the logs:
 `docker exec spacehub spacetime --root-dir /data logs --server http://127.0.0.1:3001 spacehub -f`.
+
+**Back up and restore.** `spacehub-db`, in the server image, archives
+everything in `/data` (databases, signing keys, the admin identity) to
+`/backups`, with a manifest of row counts and a checksum. Mount other storage
+there: compose binds `./backups` (or `SPACEHUB_BACKUP_HOST_DIR`). Backups
+run while the hub serves; the commit log is copied last, so an archive holds
+what a crash at that moment would have left, which SpacetimeDB recovers from.
+
+```sh
+docker compose exec spacehub spacehub-db backup --keep 14    # e.g. daily from cron; keeps the newest 14
+docker compose exec spacehub spacehub-db list
+docker compose exec spacehub spacehub-db verify /backups/<archive> --load   # boot it on the side, count its rows
+docker compose stop spacehub                                  # restore needs the server stopped
+docker compose run --rm --no-deps --entrypoint spacehub-db spacehub restore /backups/<archive> --yes
+docker compose start spacehub
+```
+
+- **Restore refuses a running server**: SpacetimeDB holds a lock on
+  `data/spacetime.pid`, which `spacehub-db` checks (also from a one-off
+  container on the same volume). What `/data` held moves to
+  `/data/.pre-restore-<time>/`; delete it once the hub works, or pass
+  `--discard-current`.
+- **Tokens keep working**: the signing keys come back with the data, so
+  builders, agents and clones need nothing after a restore.
+- **`verify --load`** starts a second SpacetimeDB with the archive on port
+  `SPACEHUB_VERIFY_PORT` (3399) and needs memory for a second copy of the
+  hub; on a small box, verify on another machine (`spacehub-db` runs anywhere
+  with `spacetime` on the PATH: `SPACETIME_ROOT=... spacehub-db ...`).
+- Keep `/backups` off the `/data` volume (it refuses a directory inside it),
+  and copy archives off the machine.
 
 **With HTTPS (compose).** `SPACEHUB_DOMAIN=hub.example.com docker compose up -d --build`
 adds a Caddy front that gets a certificate and forwards to the server. Add
@@ -684,7 +766,7 @@ spacetime start                           # terminal 1
 scripts/setup.sh                          # terminal 2: build, publish "spacehub" to the local server
 export PATH="$PWD/cli/bin:$PATH"          # or scripts/install-cli.sh
 spacehub auth login --server ws://127.0.0.1:3000 --builder <name>
-scripts/e2e.sh                            # 345 checks against a throwaway in-memory server and a stand-in GitHub
+scripts/e2e.sh                            # 401 checks against a throwaway in-memory server and a stand-in GitHub
 SPACEHUB_E2E_GITHUB=1 scripts/e2e.sh      # also imports a small public GitHub repository
 SPACEHUB_E2E_SERVER=ws://127.0.0.1:3000 scripts/e2e.sh   # against a running server, e.g. the Docker one
 ```
@@ -716,6 +798,7 @@ module/src/workspace.ts  the app's data: the hub, a space or a project as open-c
 module/src/chat.ts       chat turns from the app, committed to a conversation's .log.jsonl
 module/src/space.ts      SPACE.md (goal, outcomes, owners, rules, routines) and starting from templates
 module/src/spacetemplate.ts the built-in goal space template
+module/src/collab.ts     the project chat: post rules, the log's lines, the state they fold into
 module/src/code.ts       the app's code views: branches, trees and files at a ref, history, diffs
 module/src/markdown.ts   safe Markdown for READMEs and .md files
 module/src/diff.ts       line diffs for commit pages
@@ -738,14 +821,15 @@ cli/src/github.ts        GitHub's API, mirroring a repository, syncing linked sp
 cli/src/refplan.ts       the sync's rules: what moves, what is kept, what diverged
 cli/src/autosync.ts      autosync: commit, rebase, push; stop on a conflict; the step loop
 cli/src/spacesync.ts     a whole space in one folder: space clone and space sync
-cli/src/agentrun.ts      spacehub agent run: an agent's home and connected spaces, autosynced
+cli/src/agentrun.ts      spacehub agent run: an agent's home, connected spaces and projects, autosynced
+cli/src/collab.ts        spacehub collab: reading the project chat back from the hub
 cli/src/agenttemplate.ts the starter definition of an agent's home project
 cli/src/module_bindings  generated, do not edit
 app/                     the app: open-chat's interface over the hub (React, built with esbuild)
 Dockerfile               targets: server (default), client
 docker-compose.yml       server + Caddy TLS front
 docker/                  server entrypoint, built-in allowlist (server.Caddyfile), compose Caddyfile
-scripts/                 setup.sh, install-cli.sh, e2e.sh
+scripts/                 setup.sh, install-cli.sh, e2e.sh, spacehub-db (backups of /data)
 ```
 
 ## How it works
@@ -901,7 +985,9 @@ and pull requests. Members stop it, follow up once it stops, or tear it down.
 ## Limits (v0)
 
 - Mirroring is GitHub to hub, public repositories only.
-- Every project can be read by anyone who can reach the server. Only its
+- Every project can be read by anyone who can reach the server, its
+  project chat (`collab/`) included: membership decides who writes and what
+  `agent run` checks out, not who may read. Keep secrets out of projects. Only its
   space's owners and members and its collaborators can push; they can do
   anything a push does, including force pushes and deleting branches. To be
   one builder on several machines, sign in with the same GitHub account, or

@@ -3,3 +3,4 @@
 .git
 *.log
 scripts
+!scripts/spacehub-db

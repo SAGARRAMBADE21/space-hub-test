@@ -74,6 +74,9 @@ export interface SpaceSyncOptions {
   log: (line: string) => void;
   env?: Record<string, string>;
   author?: string; // commit as this name (agents)
+  // Follow only these projects of the space (an agent that collaborates on
+  // some projects there), not every project; the folder's manifest is left alone.
+  only?: string[];
 }
 
 export class SpaceSync {
@@ -91,15 +94,19 @@ export class SpaceSync {
     return this.o.manifest.space;
   }
 
+  private wanted(name: string) {
+    return !this.o.only || this.o.only.includes(name);
+  }
+
   // Runs until stop(), or (watching) until every project is paused: then
   // resolves true. Once: resolves after one pass.
   async run(): Promise<boolean> {
     const { conn } = this.o;
     conn.db.project.onInsert((ctx, p) => {
-      if (p.owner === this.space && ctx.event.tag !== 'SubscribeApplied') void this.add(p.id, p.name, p.defaultBranch);
+      if (p.owner === this.space && this.wanted(p.name) && ctx.event.tag !== 'SubscribeApplied') void this.add(p.id, p.name, p.defaultBranch);
     });
     await this.subscribe(tables.project.where(p => p.owner.eq(this.space)));
-    const rows = [...conn.db.project.iter()].filter(p => p.owner === this.space);
+    const rows = [...conn.db.project.iter()].filter(p => p.owner === this.space && this.wanted(p.name));
     for (const p of rows) await this.add(p.id, p.name, p.defaultBranch);
     if (this.o.mode === 'once') {
       for (const p of this.projects.values()) await this.pull(p);
@@ -152,7 +159,7 @@ export class SpaceSync {
         return;
       }
     }
-    if (!this.o.manifest.projects.includes(name)) {
+    if (!this.o.only && !this.o.manifest.projects.includes(name)) {
       this.o.manifest.projects.push(name);
       writeManifest(this.o.dir, this.o.manifest);
     }
