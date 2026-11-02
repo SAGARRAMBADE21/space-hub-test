@@ -41,7 +41,7 @@ import { commitFiles, instantiate } from './space';
 import { BUILTIN_TEMPLATE } from './spacetemplate';
 import { OLDEST_PROTOCOL, PROTOCOL } from './protocol';
 import { CHAT_FILE, CHAT_PATH, COLLAB_DIR, LOG_PATH, STATE_PATH, applyPost, parseState, postFiles, type Author, type PostIn } from './collab';
-import { COWORK_CHAT_FILE, COWORK_CHAT_PATH, COWORK_LOG_PATH, COWORK_STATE_PATH, applyCoworkPost, coworkPostFiles, parseCoworkState, type CoworkPostIn } from './cowork';
+import { COWORK_CHAT_PATH, coworkChatFile, COWORK_LOG_PATH, COWORK_STATE_PATH, applyCoworkPost, coworkPostFiles, parseCoworkState, type CoworkPostIn } from './cowork';
 
 const MAX_OBJECT_SIZE = 100 * 1024 * 1024;
 // Fetch windows are cut on `pos`, a running total of row weights per project.
@@ -1191,7 +1191,9 @@ function postToCowork(ctx: Ctx, sp: Project, post: CoworkPostIn) {
     const changes: Record<string, FileChange> = {};
     if (moved && log) changes[moved.to] = { oid: log.oid };
     for (const [path, text] of Object.entries(files)) changes[path] = encoder.encode(text);
-    if (!readFileAt(current.oid, COWORK_CHAT_PATH, read)) changes[COWORK_CHAT_PATH] = encoder.encode(COWORK_CHAT_FILE);
+    // The conversation file: made with the first post, and holding one object per thread (cowork.ts).
+    const chatFile = coworkChatFile(readFileAt(current.oid, COWORK_CHAT_PATH, read)?.text, applied.line);
+    if (chatFile !== null) changes[COWORK_CHAT_PATH] = encoder.encode(chatFile);
     const subject = `cowork: ${post.kind} #${applied.line.seq} from ${applied.line.from}`;
     const built = editFiles({ head: current.oid, changes, author: author.name, now, message: `${subject}\n\nPosted to the cowork chat (${COWORK_LOG_PATH}).`, read });
     commitToDefault(ctx, sp, current, built);

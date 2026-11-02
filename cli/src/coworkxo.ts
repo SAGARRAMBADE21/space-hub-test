@@ -22,6 +22,8 @@ const CHAT_KINDS = new Set(['message', 'request', 'response']);
 
 export interface XoChat { id: string; kind: string; project?: string | null; retired_at?: string | null }
 export interface XoMessage { id: string; seq: number; author_kind: string; author_id: string; text: string }
+/** A thread in XO Space: `ts` is the id of the message it grew from. */
+export interface XoThread { ts: string; title?: string | null; state?: string | null; status_md?: string | null; outputs?: { name?: string; path?: string }[] | null }
 
 export interface XoLink {
   /** The last cowork envelope handled; null until the first run sets it to "now". */
@@ -30,6 +32,8 @@ export interface XoLink {
   xoSeq: number | null;
   hubIds: string[];
   xoIds: string[];
+  /** The last message handled in each thread, by thread id. */
+  threadSeq: Record<string, number>;
 }
 
 function linksFile() {
@@ -46,7 +50,7 @@ function loadLinks(): Record<string, XoLink> {
 
 export function loadXoLink(project: string, xoProject: string): XoLink {
   const saved: Partial<XoLink> | undefined = loadLinks()[`${project} ${xoProject}`];
-  return { hubSeq: null, xoSeq: null, hubIds: [], xoIds: [], ...saved };
+  return { hubSeq: null, xoSeq: null, hubIds: [], xoIds: [], threadSeq: {}, ...saved };
 }
 
 export function saveXoLink(project: string, xoProject: string, link: XoLink | null) {
@@ -73,13 +77,39 @@ export function hubToXo(line: CoworkLine, me: string, link: XoLink): string | nu
  * the hub signs everything this link posts as you, so the app reads `xo` to show
  * the coordinator's words as the coordinator's (kind owner | agent | note).
  */
-export interface XoMeta { xo: { kind: 'owner' | 'agent' | 'note'; who?: string; project: string } }
+export interface XoMeta {
+  xo: { kind: 'owner' | 'agent' | 'note'; who?: string; project: string };
+  /** Set on a thread's messages; the hub keeps one object per thread in cowork.chat.json. */
+  thread?: { id: string; title: string; state: string; status: string; outputs: string[] };
+}
+
+/** Threads to follow: the ones that grew from this conversation since it was linked (their first message went through the link). */
+export function linkedThreads(threads: XoThread[], link: XoLink): XoThread[] {
+  // Once followed, a thread stays followed (threadSeq), however long ago its first message was.
+  return threads.filter(thread => thread.ts in link.threadSeq || link.xoIds.includes(thread.ts));
+}
+
+/** What the hub keeps about a thread. */
+export function threadInfo(thread: XoThread): NonNullable<XoMeta['thread']> {
+  return {
+    id: thread.ts,
+    title: (thread.title ?? '').slice(0, 200),
+    state: (thread.state ?? '').slice(0, 40),
+    status: (thread.status_md ?? '').slice(0, 2000),
+    outputs: (thread.outputs ?? []).map(output => output.name || output.path || '').filter(Boolean).slice(0, 20),
+  };
+}
+
+/** XO Space links a thread as `[title](#<message id>)`, which means nothing on the hub: keep the title, in bold. */
+export function hubText(text: string): string {
+  return text.replace(/\[([^\]]+)\]\(#cmsg_[A-Za-z0-9]+\)/g, '**$1**');
+}
 
 /** An XO Space message as hub text, posted as you, with who wrote it in XO Space. */
 export function xoToHub(message: XoMessage, link: XoLink, project: string): { content: string; meta: XoMeta } | null {
   if (link.xoIds.includes(message.id) || !message.text?.trim()) return null;
   const kind = message.author_kind === 'owner' ? 'owner' : 'agent';
-  return { content: message.text, meta: { xo: { kind, who: message.author_id, project } } };
+  return { content: hubText(message.text), meta: { xo: { kind, who: message.author_id, project } } };
 }
 
 /** The hub takes at most MAX_CONTENT characters an envelope, so a long reply goes in parts, cut at line breaks. */
@@ -114,6 +144,9 @@ export function xoSpace(base: string) {
     projectChats: async () => ((await call<{ chats: XoChat[] }>('GET', '/api/chat/chats')).chats ?? []).filter(chat => chat.kind === 'project' && chat.project && !chat.retired_at),
     latestSeq: async (chat: string) => (await call<{ messages: XoMessage[] }>('GET', `/api/chat/chats/${chat}/messages?before_seq=999999999&limit=1`)).messages?.at(-1)?.seq ?? 0,
     messagesAfter: async (chat: string, seq: number) => (await call<{ messages: XoMessage[] }>('GET', `/api/chat/chats/${chat}/messages?after_seq=${seq}&limit=100`)).messages ?? [],
+    threads: async (chat: string) => (await call<{ threads: XoThread[] }>('GET', `/api/chat/chats/${chat}/threads`)).threads ?? [],
+    threadMessagesAfter: async (chat: string, thread: string, seq: number) =>
+      (await call<{ messages: XoMessage[] }>('GET', `/api/chat/chats/${chat}/messages?thread=${encodeURIComponent(thread)}&after_seq=${seq}&limit=100`)).messages ?? [],
     post: (chat: string, text: string) => call<XoMessage>('POST', `/api/chat/chats/${chat}/messages`, { client_id: crypto.randomUUID(), text }),
   };
 }

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowRight, ArrowUp, Bot, FileText, Github, Link2, LogIn, Rocket, Square, UserRound, X } from "lucide-react";
+import { ArrowRight, ArrowUp, Bot, Check, ChevronDown, Circle, FileText, Github, Link2, LogIn, MessagesSquare, Rocket, Square, UserRound, X } from "lucide-react";
 import { MAX_MESSAGE_LENGTH } from "@/lib/demo-chat";
 import { Markdown } from "@/components/content-view";
 import { useChat } from "@/hooks/use-chat";
@@ -10,8 +10,10 @@ import { placeUrl, type Place } from "@/api";
 import { hashOf, onLink } from "@/router";
 import { Ago, Avatar, AvatarStack, ErrorNote } from "@/ui/primitives";
 
-type Message = { id: string; role: string; author: string; content: string; links?: { label: string; path: string }[]; time?: string; detail?: string; saving?: boolean; xo?: { kind: string; who: string; project: string } };
-type Conversation = { title?: unknown; subtitle?: unknown; messages: Record<string, unknown>[] };
+type Message = { id: string; role: string; author: string; content: string; links?: { label: string; path: string }[]; time?: string; detail?: string; saving?: boolean; xo?: { kind: string; who: string; project: string }; seq?: number; thread?: string };
+/** `threads`: the cowork chat keeps one object per thread (module/src/cowork.ts). */
+type Conversation = { title?: unknown; subtitle?: unknown; messages: Record<string, unknown>[]; threads?: unknown };
+type Thread = { id: string; title: string; state: string; status: string; outputs: string[]; first_seq: number; updated: string; messages: Message[] };
 
 const text = (value: unknown) => (typeof value === "string" ? value : "");
 
@@ -48,6 +50,16 @@ export function ChatView({ place, path, data, repliesPath, logExists, me, canWri
   const lastAt = last?.time ? Date.parse(last.time) : NaN;
   // Your message is the last word and recent: the coordinator is on it (its reply comes back through the link).
   const replying = xo && !!last && isMine(last, me) && (!!last.saving || (now - lastAt >= -60_000 && now - lastAt < 3 * 60_000));
+  // Each thread is its own object in the file; its messages show in its card, not in the main conversation.
+  const threads = xo ? threadsOf(data.threads, xoProject) : [];
+  const items: ({ kind: "message"; message: Message; index: number } | { kind: "thread"; thread: Thread })[] = [];
+  const main = xo ? all.filter(message => !message.thread) : all;
+  let next = 0;
+  main.forEach((message, index) => {
+    while (next < threads.length && message.seq !== undefined && threads[next].first_seq < message.seq) items.push({ kind: "thread", thread: threads[next++] });
+    items.push({ kind: "message", message, index });
+  });
+  while (next < threads.length) items.push({ kind: "thread", thread: threads[next++] });
 
   useEffect(() => { end.current?.scrollIntoView({ block: "end", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" }); }, [all.length, chat.pending, replying]);
   useEffect(() => {
@@ -61,9 +73,11 @@ export function ChatView({ place, path, data, repliesPath, logExists, me, canWri
       {people.length > 0 && <AvatarStack names={people} />}
     </div>}
     {xo ? <ol className="xo-msgs">
-      {all.length === 0 && <li className="xo-empty">No messages yet. Tell the {xoProject} coordinator what you would like done.</li>}
-      {all.map((message, index) => <XoRow key={message.id} message={message} cont={index > 0 && sameSpeaker(all[index - 1], message, me)} me={me} path={path} onOpen={onOpen} />)}
-      {replying && <li className="xo-them"><span className="xo-tile"><XoMark /></span><div className="xo-body"><div className="xo-head"><b>{xoProject} coordinator</b></div><div className="xo-shimmer">The coordinator is replying…</div></div></li>}
+      {items.length === 0 && <li className="xo-empty">No messages yet. Tell the {xoProject} coordinator what you would like done.</li>}
+      {items.map((item, i) => item.kind === "thread"
+        ? <ThreadCard key={"thread-" + item.thread.id} thread={item.thread} me={me} path={path} onOpen={onOpen} />
+        : <XoRow key={item.message.id} message={item.message} cont={i > 0 && items[i - 1].kind === "message" && sameSpeaker((items[i - 1] as { message: Message }).message, item.message, me)} me={me} path={path} onOpen={onOpen} />)}
+      {replying && <li className="xo-them"><div className="xo-head"><b>{xoProject} coordinator</b></div><div className="xo-shimmer">The coordinator is replying…</div></li>}
       <div ref={end} />
     </ol>
     : <ol className="thread">
@@ -129,11 +143,63 @@ function useNow(every: number) {
 
 const when = (time: string | undefined) => !time ? null : /^\d{4}-/.test(time) ? <Ago iso={time} /> : <span>{time}</span>;
 
-/** XO's mark: the two chevrons, the second in XO green. */
-function XoMark() {
-  return <svg viewBox="0 0 24 24" width="15" height="15" fill="none" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-    <path d="M4 6.5 9.5 12 4 17.5" stroke="currentColor" /><path d="M20 6.5 14.5 12l5.5 5.5" stroke="var(--xo-green)" />
-  </svg>;
+const str = (value: unknown) => (typeof value === "string" ? value : "");
+
+/** The threads object of cowork.chat.json, in the order they started; their messages as the chat's. */
+function threadsOf(value: unknown, project: string): Thread[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.values(value as Record<string, Record<string, unknown>>)
+    .filter(thread => thread && typeof thread === "object" && typeof thread.id === "string")
+    .map(thread => ({
+      id: thread.id as string,
+      title: str(thread.title),
+      state: str(thread.state),
+      status: str(thread.status),
+      outputs: Array.isArray(thread.outputs) ? thread.outputs.filter((o): o is string => typeof o === "string") : [],
+      first_seq: typeof thread.first_seq === "number" ? thread.first_seq : 0,
+      updated: str(thread.updated),
+      messages: (Array.isArray(thread.messages) ? thread.messages : []).map((m: Record<string, unknown>, i: number) => {
+        const xo = m.xo && typeof m.xo === "object" ? m.xo as Record<string, unknown> : {};
+        const agent = xo.kind === "agent" || m.role === "assistant";
+        const who = str(xo.who);
+        return {
+          id: str(m.id) || `${thread.id}-${i}`,
+          role: agent ? "assistant" : "user",
+          author: !agent ? str(m.author) : !who || who === "project-coordinator" ? `${project} coordinator` : who === "thread" ? `${project} agent` : who,
+          content: str(m.content),
+          time: str(m.time) || undefined,
+          seq: typeof m.seq === "number" ? m.seq : undefined,
+        };
+      }),
+    }))
+    .sort((a, b) => a.first_seq - b.first_seq);
+}
+
+const STATES: Record<string, string> = { resolved: "Finished", done: "Finished", working: "Working", running: "Working", needs_reply: "Needs you", waiting: "Needs you", failed: "Failed", stopped: "Stopped" };
+
+/** A thread as one card: title, state and checklist; open it for its messages and outputs. */
+function ThreadCard({ thread, me, path, onOpen }: { thread: Thread; me: string | null; path: string; onOpen: (path: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const state = STATES[thread.state] ?? (thread.state ? thread.state.replace(/_/g, " ") : "Thread");
+  const tone = /resolved|done/.test(thread.state) ? "done" : /fail|stop/.test(thread.state) ? "bad" : /needs|wait/.test(thread.state) ? "you" : "live";
+  const steps = thread.status.split("\n").map(line => line.trim()).filter(Boolean);
+  return <li className={`xo-thread${open ? " open" : ""}`}>
+    <button type="button" className="xo-thread-head" aria-expanded={open} onClick={() => setOpen(value => !value)}>
+      <MessagesSquare size={15} className="xo-thread-ic" />
+      <span className="xo-thread-title">{thread.title || "Thread"}</span>
+      <span className={`xo-pill ${tone}`}>{state}</span>
+      <span className="xo-thread-count">{thread.messages.length} {thread.messages.length === 1 ? "message" : "messages"}</span>
+      <ChevronDown size={15} className="xo-thread-chev" />
+    </button>
+    {steps.length > 0 && <ul className="xo-steps">{steps.map((step, i) => {
+      const done = step.startsWith("✓");
+      return <li key={i} className={done ? "done" : ""}>{done ? <Check size={13} /> : <Circle size={11} />}<span>{step.replace(/^[✓○●•\-]\s*/, "")}</span></li>;
+    })}</ul>}
+    {thread.outputs.length > 0 && <div className="xo-outputs">{thread.outputs.map(name => <span key={name}><FileText size={13} />{name}</span>)}</div>}
+    {open && <ol className="xo-thread-msgs">
+      {thread.messages.map((message, i) => <XoRow key={message.id} message={message} cont={i > 0 && sameSpeaker(thread.messages[i - 1], message, me)} me={me} path={path} onOpen={onOpen} />)}
+    </ol>}
+  </li>;
 }
 
 /**
@@ -148,14 +214,10 @@ function XoRow({ message, cont, me, path, onOpen }: { message: Message; cont: bo
     {links}
     <div className="xo-meta">{message.saving ? "Sending…" : when(message.time)}</div>
   </li>;
-  const agent = message.role === "assistant";
   return <li className={`xo-them${cont ? " cont" : ""}`}>
-    <span className="xo-tile">{cont ? null : agent ? <XoMark /> : <Avatar name={message.author} size={30} />}</span>
-    <div className="xo-body">
-      {!cont && <div className="xo-head"><b>{message.author || "User"}</b>{message.detail && <span>{message.detail}</span>}{when(message.time)}</div>}
-      <div className="xo-prose"><Markdown content={message.content} filePath={path} navigate={onOpen} /></div>
-      {links}
-    </div>
+    {!cont && <div className="xo-head"><b>{message.author || "User"}</b>{message.detail && <span>{message.detail}</span>}{when(message.time)}</div>}
+    <div className="xo-prose"><Markdown content={message.content} filePath={path} navigate={onOpen} /></div>
+    {links}
   </li>;
 }
 

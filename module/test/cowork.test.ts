@@ -182,6 +182,27 @@ describe('cowork chat', () => {
     expect(() => call(bob, mod.appendChat, { project: PROJECT, conversation: 'collab/other.json', turns: [{ id: 'm2', role: 'user', content: 'x', links: [] }] })).toThrow(/cowork\.chat\.json/);
   });
 
+  it('keeps one object per thread in cowork.chat.json, and the log as before', () => {
+    const { alice, send, read, log } = hub();
+    send(alice, { content: 'Research diff engines' });
+    const before = read(COWORK_CHAT_PATH);
+    send(alice, { content: 'Unrelated' });
+    expect(read(COWORK_CHAT_PATH)).toBe(before); // no thread, no change
+
+    const thread = (extra: object) => JSON.stringify({ xo: { kind: 'agent', who: 'thread', project: 'site' }, thread: { id: 'cmsg_1', ...extra } });
+    send(alice, { content: 'Starting.', meta: thread({ title: 'Diff engines', state: 'working' }) });
+    send(alice, { content: 'Done: see the write-up.', meta: thread({ state: 'resolved', status: '✓ Wrote it up', outputs: ['diff.md'] }) });
+    send(alice, { content: 'Other work', meta: JSON.stringify({ thread: { id: 'cmsg_2', title: 'Other' } }) });
+    expect(() => send(alice, { content: 'Bad id', meta: JSON.stringify({ thread: { id: '../x' } }) })).not.toThrow();
+
+    const chat = JSON.parse(read(COWORK_CHAT_PATH)!);
+    expect(chat.title).toBe('Cowork chat');
+    expect(Object.keys(chat.threads)).toEqual(['cmsg_1', 'cmsg_2']);
+    expect(chat.threads.cmsg_1).toMatchObject({ id: 'cmsg_1', title: 'Diff engines', state: 'resolved', status: '✓ Wrote it up', outputs: ['diff.md'], first_seq: 3, last_seq: 4 });
+    expect(chat.threads.cmsg_1.messages.map((m: any) => [m.seq, m.content, m.xo?.who])).toEqual([[3, 'Starting.', 'thread'], [4, 'Done: see the write-up.', 'thread']]);
+    expect(log().map(l => l.content)).toEqual(['Research diff engines', 'Unrelated', 'Starting.', 'Done: see the write-up.', 'Other work', 'Bad id']);
+  });
+
   it('refuses pushes that change the cowork files', () => {
     const { bob, call, head } = hub();
     call(bob, mod.coworkPost, { project: PROJECT, id: 'c1', kind: 'connect', cowork: 'bob-box', agent: '', content: '', to: [], replyTo: '', delegation: '', title: '', status: '', key: '', meta: '' });

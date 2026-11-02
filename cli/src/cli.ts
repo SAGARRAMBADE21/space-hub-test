@@ -22,7 +22,7 @@ import { cloneProject, findManifest, SpaceSync, writeManifest } from './spacesyn
 import { DEFAULT_HUB_HOST, githubTokenTarget, hubUrl, parseHubUrl, REMOTE } from './url';
 import { deviceSignIn } from './devicelogin';
 import { formatLine, formatState, linesSince, newPost, POST_KINDS, readChat, TASK_STATUSES, type CollabLine } from './collab';
-import { DEFAULT_XO_URL, type XoMeta, hubToXo, loadXoLink, saveXoLink, splitContent, xoSpace, xoToHub } from './coworkxo';
+import { DEFAULT_XO_URL, type XoMeta, hubToXo, linkedThreads, threadInfo, loadXoLink, saveXoLink, splitContent, xoSpace, xoToHub } from './coworkxo';
 import { addressedTo, briefing, coworkLinesSince, formatCoworkLine, formatCoworkState, loadProfile, newEnvelope, readCoworkChat, saveProfile, type CoworkLine } from './cowork';
 
 quietSdkLogs();
@@ -1367,6 +1367,21 @@ async function coworkXo(args: string[]) {
       link.xoIds.push(message.id);
       link.xoSeq = Math.max(link.xoSeq, message.seq);
       save();
+    }
+    // Threads that grew from this conversation: their messages go to the hub tagged with the thread.
+    for (const thread of linkedThreads(await xo.threads(chat.id), link)) {
+      const info = threadInfo(thread);
+      link.threadSeq[thread.ts] ??= 0;
+      for (const message of await xo.threadMessagesAfter(chat.id, thread.ts, link.threadSeq[thread.ts] ?? 0)) {
+        const turn = xoToHub(message, link, xoProject);
+        if (turn) {
+          await post(turn.content, { ...turn.meta, thread: info });
+          note(`XO Space thread "${info.title || thread.ts}" ${message.author_id} → ${fullName}`);
+        }
+        link.xoIds.push(message.id);
+        link.threadSeq[thread.ts] = Math.max(link.threadSeq[thread.ts] ?? 0, message.seq);
+        save();
+      }
     }
   });
 

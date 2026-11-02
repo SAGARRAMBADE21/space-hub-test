@@ -2,7 +2,7 @@ import { MAX_MESSAGE_LENGTH, type DemoMessage } from "./demo-chat";
 
 /** A chat turn saved on the hub: one JSON object per line of `<conversation>.log.jsonl`. */
 /** `xo`: the line came through `spacehub cowork xo`, which says who wrote it in XO Space (owner, agent or note). */
-export type ChatTurn = DemoMessage & { author?: string; time?: string; detail?: string; note?: boolean; xo?: { kind: "owner" | "agent" | "note"; who: string; project: string } };
+export type ChatTurn = DemoMessage & { author?: string; time?: string; detail?: string; note?: boolean; xo?: { kind: "owner" | "agent" | "note"; who: string; project: string }; seq?: number; thread?: string };
 
 const COWORK_NOTES: Record<string, string> = { connect: "connected", disconnect: "disconnected", status: "status" };
 
@@ -41,7 +41,7 @@ function xoTurn(value: Record<string, unknown>): Partial<ChatTurn> | undefined {
   if (!xo || (xo.kind !== "owner" && xo.kind !== "agent" && xo.kind !== "note")) return;
   const project = typeof xo.project === "string" ? xo.project : "";
   const who = typeof xo.who === "string" ? xo.who : "";
-  const tag = { xo: { kind: xo.kind, who, project } } as const;
+  const tag = { xo: { kind: xo.kind, who, project }, ...(object(meta!.thread) && typeof meta!.thread.id === "string" ? { thread: meta!.thread.id } : {}) } as const;
   if (xo.kind === "note") return { ...tag, note: true };
   if (xo.kind === "owner") return tag;
   const author = !who || who === "project-coordinator" ? `${project} coordinator`.trim() : who;
@@ -91,6 +91,7 @@ export function parseChatLog(content: string): ChatTurn[] {
       ...(typeof value.author === "string" ? { author: value.author } : {}),
       ...(typeof value.time === "string" ? { time: value.time } : {}),
       ...(collabDetail(value) ? { detail: collabDetail(value) } : {}),
+      ...(typeof value.seq === "number" ? { seq: value.seq } : {}),
       ...coworkTurn(value),
       ...xoTurn(value),
     });

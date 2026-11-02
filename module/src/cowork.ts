@@ -608,6 +608,71 @@ export function coworkPostFiles(log: string, before: CoworkState, applied: { sta
 
 export const COWORK_CHAT_FILE = JSON.stringify({ type: 'conversation', title: 'Cowork chat', messages: [] }, null, 2) + '\n';
 
+// ---------------------------------------------------------------- threads
+//
+// A thread is a side conversation that grew out of the cowork chat (in XO
+// Space, a thread its coordinator started). An envelope in one says so in
+// meta.thread: {id, title?, state?, status?, outputs?}. The log keeps every
+// envelope as before; cowork.chat.json also keeps one object per thread,
+// under `threads`, with its title, state, checklist, outputs and messages,
+// so each thread reads on its own.
+
+export const MAX_THREADS = 50;
+export const MAX_THREAD_MESSAGES = 200;
+const THREAD_ID = /^[A-Za-z0-9_.:-]{1,100}$/;
+
+export interface CoworkThreadMeta { id: string; title: string; state: string; status: string; outputs: string[] | null }
+export interface CoworkThreadMessage { seq: number; id: string; role: 'user' | 'assistant'; author: string; content: string; time: string; xo?: Record<string, unknown> }
+export interface CoworkThread { id: string; title: string; state: string; status: string; outputs: string[]; first_seq: number; last_seq: number; updated: string; messages: CoworkThreadMessage[] }
+
+const text = (value: unknown, max: number) => (typeof value === 'string' ? value.slice(0, max) : '');
+
+/** The thread an envelope belongs to, from its meta, or null. */
+export function threadMeta(meta: Record<string, unknown> | undefined): CoworkThreadMeta | null {
+  const thread = meta && object(meta.thread) ? meta.thread : null;
+  if (!thread || typeof thread.id !== 'string' || !THREAD_ID.test(thread.id)) return null;
+  const outputs = Array.isArray(thread.outputs) ? thread.outputs.filter((o): o is string => typeof o === 'string').slice(0, 20).map(o => o.slice(0, 200)) : null;
+  return { id: thread.id, title: text(thread.title, 200), state: text(thread.state, 40), status: text(thread.status, 2000), outputs };
+}
+
+/**
+ * cowork.chat.json after `line`: the file itself when it is missing, and the
+ * line's thread brought up to date when it has one. Null: nothing changes.
+ * The most recent MAX_THREADS threads stay, each with its last MAX_THREAD_MESSAGES.
+ */
+export function coworkChatFile(current: string | null | undefined, line: CoworkLine): string | null {
+  const thread = threadMeta(line.meta);
+  if (current && !thread) return null;
+  let chat: Record<string, unknown> | null = null;
+  try {
+    const parsed: unknown = current ? JSON.parse(current) : null;
+    if (object(parsed)) chat = parsed;
+  } catch {
+    /* A broken file is written fresh. */
+  }
+  chat ??= JSON.parse(COWORK_CHAT_FILE) as Record<string, unknown>;
+  if (thread) {
+    const threads: Record<string, CoworkThread> = object(chat.threads) ? (chat.threads as Record<string, CoworkThread>) : {};
+    const old = object(threads[thread.id]) ? threads[thread.id] : undefined;
+    const xo = line.meta && object(line.meta.xo) ? line.meta.xo : undefined;
+    const message: CoworkThreadMessage = { seq: line.seq, id: line.id, role: line.role, author: line.author, content: line.content, time: line.time, ...(xo ? { xo } : {}) };
+    threads[thread.id] = {
+      id: thread.id,
+      title: thread.title || old?.title || '',
+      state: thread.state || old?.state || '',
+      status: thread.status || old?.status || '',
+      outputs: thread.outputs ?? old?.outputs ?? [],
+      first_seq: old?.first_seq ?? line.seq,
+      last_seq: line.seq,
+      updated: line.time,
+      messages: [...(Array.isArray(old?.messages) ? old.messages : []), message].slice(-MAX_THREAD_MESSAGES),
+    };
+    const kept = Object.values(threads).sort((a, b) => b.last_seq - a.last_seq).slice(0, MAX_THREADS);
+    chat.threads = Object.fromEntries(kept.sort((a, b) => a.first_seq - b.first_seq).map(t => [t.id, t]));
+  }
+  return JSON.stringify(chat, null, 2) + '\n';
+}
+
 /** A short, readable form of one line, for terminals and agents' prompts. */
 export function formatCoworkLine(line: CoworkLine) {
   const who = line.cowork ? `${line.from} (${line.user})` : line.from;

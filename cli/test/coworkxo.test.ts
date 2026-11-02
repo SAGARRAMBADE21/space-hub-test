@@ -5,11 +5,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { hubToXo, loadXoLink, saveXoLink, splitContent, xoToHub, type XoLink } from '../src/coworkxo.ts';
+import { hubText, hubToXo, linkedThreads, loadXoLink, saveXoLink, splitContent, threadInfo, xoToHub, type XoLink } from '../src/coworkxo.ts';
 import type { CoworkLine } from '../../module/src/cowork.ts';
 
 const me = 'sagar';
-const empty = (): XoLink => ({ hubSeq: 0, xoSeq: 0, hubIds: [], xoIds: [] });
+const empty = (): XoLink => ({ hubSeq: 0, xoSeq: 0, hubIds: [], xoIds: [], threadSeq: {} });
 const line = (fields: Partial<CoworkLine>): CoworkLine => ({ seq: 1, id: 'e1', type: 'message', role: 'user', author: 'sagar', user: 'sagar', from: 'sagar', content: 'hello', time: '2026-11-02T00:00:00Z', ...fields });
 
 test('your own message on the hub goes to XO Space as it is', () => {
@@ -49,11 +49,23 @@ test('where each side was read is kept per project and XO Space project', () => 
   process.env.SPACEHUB_HOME = home;
   try {
     assert.equal(loadXoLink('a/b', 'b').hubSeq, null);
-    saveXoLink('a/b', 'b', { hubSeq: 4, xoSeq: 9, hubIds: ['x'], xoIds: ['y'] });
-    assert.deepEqual(loadXoLink('a/b', 'b'), { hubSeq: 4, xoSeq: 9, hubIds: ['x'], xoIds: ['y'] });
+    saveXoLink('a/b', 'b', { hubSeq: 4, xoSeq: 9, hubIds: ['x'], xoIds: ['y'], threadSeq: { t: 3 } });
+    assert.deepEqual(loadXoLink('a/b', 'b'), { hubSeq: 4, xoSeq: 9, hubIds: ['x'], xoIds: ['y'], threadSeq: { t: 3 } });
     assert.equal(loadXoLink('a/b', 'other').xoSeq, null);
   } finally {
     if (before === undefined) delete process.env.SPACEHUB_HOME;
     else process.env.SPACEHUB_HOME = before;
   }
+});
+
+test('threads: only those grown from the linked conversation, and what the hub keeps of them', () => {
+  const threads = [{ ts: 'cmsg_a', title: 'Diff engines', state: 'resolved', status_md: '✓ Done', outputs: [{ name: 'diff.md' }] }, { ts: 'cmsg_b' }, { ts: 'cmsg_c' }];
+  assert.deepEqual(linkedThreads(threads, { ...empty(), xoIds: ['cmsg_a'], threadSeq: { cmsg_c: 4 } }).map(t => t.ts), ['cmsg_a', 'cmsg_c']);
+  assert.deepEqual(threadInfo(threads[0]), { id: 'cmsg_a', title: 'Diff engines', state: 'resolved', status: '✓ Done', outputs: ['diff.md'] });
+  assert.deepEqual(threadInfo(threads[1]), { id: 'cmsg_b', title: '', state: '', status: '', outputs: [] });
+});
+
+test('XO Space thread links become the bold title', () => {
+  assert.equal(hubText('The write-up is in [Diff engine research](#cmsg_c7c4ed3741924940).'), 'The write-up is in **Diff engine research**.');
+  assert.equal(hubText('[a link](https://example.com)'), '[a link](https://example.com)');
 });
